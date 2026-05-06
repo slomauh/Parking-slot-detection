@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+
+data/raw/
+data/processed/
+data/samples/*.mp4
+models/**/*.pt
+outputs/
+external/

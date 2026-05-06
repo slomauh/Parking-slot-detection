@@ -1,0 +1,49 @@
+video:
+  source: "data/samples/demo.mp4"
+  output_path: "outputs/videos/demo_result.mp4"
+  save_json: true
+  json_path: "outputs/json/demo_result.json"
+
+runtime:
+  device: "cpu"
+  detect_every_n_frames: 3
+  parking_slot_every_n_frames: 5
+  max_frames: null
+
+vehicle_detector:
+  backend: "yolo"  # mock | yolo
+  enabled: true
+  model_path: "models/vehicle/yolo11n.pt"
+  device: "cpu"
+  classes:
+    - car
+    - truck
+    - bus
+    - motorcycle
+    - person
+  conf_threshold: 0.35
+  imgsz: 640
+
+parking_slot_detector:
+  backend: "mock"  # mock | crpsd
+  model_path: "/home/slomauh/pretrain_model/pretrain_model/1:2.pth"
+  external_repo_path: "external/CRPS-D"
+  device: "cpu"
+  depth_factor: 32
+  conf_threshold: 0.40
+  imgsz: 512
+
+tracker:
+  type: "bytetrack"
+  max_missed_frames: 15
+
+occupancy:
+  slot_coverage_threshold: 0.20
+  speed_threshold_px: 2.0
+  occupied_confirm_frames: 5
+  free_confirm_frames: 10
+
+visualization:
+  draw_slots: true
+  draw_detections: true
+  draw_tracks: true
