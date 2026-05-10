@@ -23,6 +23,7 @@ class ParkingSlot:
     points: Polygon
     confidence: float = 1.0
     type: str = "unknown"
+    occupancy_label: SlotStatus | None = None
 
 
 @dataclass(slots=True)
@@ -44,4 +45,15 @@ class SlotState:
     free_counter: int = 0
     last_seen_frame: int = 0
     assigned_track_id: int | None = None
+    confidence: float | None = None
+    source: str = "unknown"
     slot: ParkingSlot | None = field(default=None, repr=False)
+
+
+@dataclass(slots=True)
+class OccupancyDecision:
+    slot_id: int
+    status: SlotStatus
+    confidence: float
+    source: str
+    assigned_track_id: int | None = None

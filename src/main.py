@@ -75,8 +75,8 @@ def main() -> None:
                 last_slots = slot_detector.detect(frame)
 
             tracks = tracker.update(last_detections)
-            assignments = occupancy_estimator.estimate(last_slots, tracks)
-            states = state_manager.update(frame_idx, last_slots, assignments)
+            decisions = occupancy_estimator.estimate(last_slots, tracks, frame)
+            states = state_manager.update(frame_idx, last_slots, decisions)
 
             rendered = visualizer.draw(frame, last_detections, tracks, states)
             writer.write(rendered)
@@ -89,6 +89,8 @@ def main() -> None:
                             "slot_id": state.slot_id,
                             "status": state.status,
                             "assigned_track_id": state.assigned_track_id,
+                            "confidence": state.confidence,
+                            "source": state.source,
                             "occupied_counter": state.occupied_counter,
                             "free_counter": state.free_counter,
                             "points": state.slot.points if state.slot else None,
