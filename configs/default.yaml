@@ -38,7 +38,7 @@ tracker:
   max_missed_frames: 15
 
 occupancy:
-  backend: "geometry"  # geometry | classifier
+  backend: "classifier"  # geometry | classifier
   slot_coverage_threshold: 0.20
   speed_threshold_px: 2.0
   occupied_confirm_frames: 5
