@@ -25,12 +25,12 @@ vehicle_detector:
   imgsz: 640
 
 parking_slot_detector:
-  backend: "mock"  # mock | crpsd
-  model_path: "/home/slomauh/pretrain_model/pretrain_model/1:2.pth"
+  backend: "crpsd"  # mock | crpsd
+  model_path: "models/slot_detector/parkrecon3d_slot_detector_finetuned.pth"
   external_repo_path: "external/CRPS-D"
   device: "cpu"
   depth_factor: 32
-  conf_threshold: 0.40
+  conf_threshold: 0.05
   imgsz: 512
 
 tracker:

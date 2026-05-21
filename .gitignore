@@ -12,5 +12,7 @@ data/raw/
 data/processed/
 data/samples/*.mp4
 models/**/*.pt
+models/**/*.pth
+models/**/*.json
 outputs/
 external/

@@ -69,6 +69,7 @@ scripts/
   evaluate_full_pipeline_crpsd.py
   evaluate_parkrecon3d_bev.py
   convert_parkrecon3d_bev.py
+  prepare_parkrecon3d_camera_images.py
   test_parking_slot_detector_crpsd.py
   test_vehicle_detector_crpsd.py
 
@@ -240,14 +241,16 @@ end_to_end_slot_status_accuracy_over_gt: 82.02%
 ParkRecon3D был скачан локально сюда:
 
 ```text
-/home/slomauh/Downloads/data1
+/home/slomauh/Documents/data1
+/home/slomauh/Documents/data2
+/home/slomauh/Documents/data3
 ```
 
 Для тестов брались только BEV-изображения:
 
 ```text
-/home/slomauh/Downloads/data1/BEV/Data/Image
-/home/slomauh/Downloads/data1/BEV/Data/label
+<dataset_part>/BEV/Data/Image
+<dataset_part>/BEV/Data/label
 ```
 
 В `label/*.json` есть геометрия слотов:
@@ -265,7 +268,7 @@ ParkRecon3D был скачан локально сюда:
 
 ```bash
 python scripts/evaluate_parkrecon3d_bev.py \
-  --dataset-root /home/slomauh/Downloads/data1 \
+  --dataset-root /home/slomauh/Documents/data1 \
   --limit 30 \
   --device cpu \
   --slot-model-path /home/slomauh/pretrain_model/pretrain_model/1:2.pth \
@@ -300,7 +303,10 @@ scripts/convert_parkrecon3d_bev.py
 
 ```bash
 python scripts/convert_parkrecon3d_bev.py \
-  --dataset-root /home/slomauh/Downloads/data1 \
+  --dataset-roots \
+    /home/slomauh/Documents/data1 \
+    /home/slomauh/Documents/data2 \
+    /home/slomauh/Documents/data3 \
   --output-dir outputs/parkrecon3d_bev_crpsd_format \
   --val-ratio 0.2 \
   --image-size 512 \
@@ -310,7 +316,8 @@ python scripts/convert_parkrecon3d_bev.py \
 
 Что делает:
 
-- берет BEV images и labels;
+- берет BEV images и labels из одной или нескольких частей ParkRecon3D;
+- удаляет дубли по timestamp/image id;
 - ресайзит изображения до `512x512`;
 - пересчитывает координаты marks;
 - создает raw CRPS-D-like формат для оценки;
@@ -335,22 +342,24 @@ outputs/parkrecon3d_bev_crpsd_format/
 Текущий converted dataset:
 
 ```text
-total_pairs: 1426
-train images: 1111
-train slots: 5333
-test images: 285
-test slots: 1264
+total_pairs: 5005
+duplicate_pairs_dropped: 429
+train images: 3974
+train slots: 15937
+test images: 1001
+test slots: 4786
 dropped gap frames: 30
 ```
 
 Проверка на утечки:
 
 ```text
-test with train neighbor <= 1 frame: 0/285
-test with train neighbor <= 10 frames: 0/285
-test with train neighbor <= 30 frames: 0/285
+test with train neighbor <= 1 frame: 0/1001
+test with train neighbor <= 10 frames: 0/1001
+test with train neighbor <= 30 frames: 0/1001
 min nearest frame distance: 31
-dHash near duplicates up to 32/256 bits: 0
+dHash exact duplicates: 0
+dHash near duplicates up to 8/256 bits: 0
 ```
 
 Архив для загрузки в Kaggle:
@@ -359,7 +368,86 @@ dHash near duplicates up to 32/256 bits: 0
 outputs/kaggle_parkrecon3d_bev_dataset/parkrecon3d_bev_crpsd_format.zip
 ```
 
-Размер примерно `346M`.
+Размер примерно `1.2G`.
+
+Для fine-tune slot detector на Kaggle подготовлена отдельная инструкция:
+
+```text
+docs/kaggle_slot_detector_finetune.md
+```
+
+Нужно загрузить в Kaggle три zip-архива:
+
+```text
+outputs/kaggle_parkrecon3d_bev_dataset/parkrecon3d_bev_crpsd_format.zip
+outputs/kaggle_slot_detector_training_code/slot_detector_training_code.zip
+outputs/kaggle_slot_detector_weights/crpsd_slot_detector_pretrained_1_2.zip
+```
+
+### ParkRecon3D Camera0/Camera1/Camera2
+
+В ParkRecon3D также есть обычные камеры:
+
+```text
+<dataset_part>/Camera0/Data/Image
+<dataset_part>/Camera1/Data/Image
+<dataset_part>/Camera2/Data/Image
+```
+
+В этих папках нет `label/*.json` с разметкой парковочных мест, поэтому они подготовлены как image-only splits. Их можно использовать для визуальной проверки домена, inference без метрик, future pseudo-labeling или ручной разметки. Для supervised fine-tune текущего slot detector использовать их напрямую нельзя.
+
+Подготовка:
+
+```bash
+python scripts/prepare_parkrecon3d_camera_images.py \
+  --dataset-roots \
+    /home/slomauh/Documents/data1 \
+    /home/slomauh/Documents/data2 \
+    /home/slomauh/Documents/data3 \
+  --cameras Camera0 Camera1 Camera2 \
+  --output-dir outputs/parkrecon3d_camera_images \
+  --image-size 512 \
+  --val-ratio 0.2 \
+  --split-strategy chronological \
+  --gap-size 30
+```
+
+Выход:
+
+```text
+outputs/parkrecon3d_camera_images/
+  Camera0/train/img/
+  Camera0/test/img/
+  Camera1/train/img/
+  Camera1/test/img/
+  Camera2/train/img/
+  Camera2/test/img/
+  summary.json
+```
+
+Текущий split:
+
+```text
+Camera0: train 3974, test 1001
+Camera1: train 3974, test 1001
+Camera2: train 3974, test 1001
+```
+
+Архив для Kaggle:
+
+```text
+outputs/kaggle_parkrecon3d_camera_images/parkrecon3d_camera_images.zip
+```
+
+Папки `IMU` и `Wheel` содержат CSV с синхронизированными сенсорными данными автомобиля. `IMU` обычно нужен для ускорений/угловых скоростей, `Wheel` - для колесной одометрии, скорости/поворота и оценки движения машины. Они полезны для задач локализации, ego-motion, 3D-реконструкции и синхронизации кадров, но текущий image-only slot detector их не использует.
+
+Эксперимент с проекцией BEV-разметки на `Camera0/Camera1/Camera2` описан здесь:
+
+```text
+docs/parkrecon3d_camera_projection.md
+```
+
+Короткий вывод: проекция возможна через calibration files `param.yaml` и `stitch.json`, но перед генерацией train labels для камер нужна фильтрация видимости и ручная проверка, иначе часть лейблов попадет на капот или в невидимые области.
 
 ## Что сделано
 
@@ -376,6 +464,8 @@ outputs/kaggle_parkrecon3d_bev_dataset/parkrecon3d_bev_crpsd_format.zip
 11. Сделан конвертер ParkRecon3D BEV в CRPS-D-like формат.
 12. Исправлен split ParkRecon3D BEV: random split заменен на хронологический split с gap, чтобы убрать leakage между train и test.
 13. Собран Kaggle zip для ParkRecon3D BEV fine-tune.
+14. Подготовлены image-only splits для ParkRecon3D Camera0/Camera1/Camera2.
+15. Сделан первичный эксперимент с проекцией BEV labels на fisheye камеры.
 
 ## Что планируется дальше
 

@@ -13,7 +13,17 @@ from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert ParkRecon3D BEV to CRPS-D-like training/eval datasets")
-    parser.add_argument("--dataset-root", default="/home/slomauh/Downloads/data1")
+    parser.add_argument(
+        "--dataset-root",
+        action="append",
+        dest="dataset_root",
+        help="ParkRecon3D part root. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--dataset-roots",
+        nargs="+",
+        help="ParkRecon3D part roots. Alternative to repeated --dataset-root.",
+    )
     parser.add_argument("--output-dir", default="outputs/parkrecon3d_bev_crpsd_format")
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--val-ratio", type=float, default=0.2)
@@ -27,16 +37,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    dataset_root = Path(args.dataset_root)
-    image_dir = dataset_root / "BEV" / "Data" / "Image"
-    label_dir = dataset_root / "BEV" / "Data" / "label"
+    dataset_roots = resolve_dataset_roots(args)
     output_dir = Path(args.output_dir)
 
-    pairs = collect_pairs(image_dir, label_dir)
+    pairs, duplicate_count = collect_pairs(dataset_roots)
     if args.limit is not None:
         pairs = pairs[: args.limit]
     if not pairs:
-        raise FileNotFoundError(f"No image/label pairs found in {image_dir} and {label_dir}")
+        raise FileNotFoundError(f"No image/label pairs found in {dataset_roots}")
 
     train_pairs, val_pairs, gap_pairs = split_pairs(pairs, args.val_ratio, args.split_strategy, args.gap_size, args.seed)
 
@@ -61,7 +69,7 @@ def main() -> None:
     val_stats = convert_split(val_pairs, val_raw, val_prepared, args.image_size, args.jpeg_quality)
 
     summary = {
-        "dataset_root": str(dataset_root),
+        "dataset_roots": [str(path) for path in dataset_roots],
         "output_dir": str(output_dir),
         "image_size": args.image_size,
         "val_ratio": args.val_ratio,
@@ -69,6 +77,7 @@ def main() -> None:
         "gap_size": args.gap_size,
         "seed": args.seed,
         "total_pairs": len(pairs),
+        "duplicate_pairs_dropped": duplicate_count,
         "dropped_gap_pairs": len(gap_pairs),
         "gap_range": stem_range(gap_pairs),
         "train_range": stem_range(train_pairs),
@@ -91,13 +100,44 @@ def main() -> None:
     print(json.dumps(summary, indent=2))
 
 
-def collect_pairs(image_dir: Path, label_dir: Path) -> list[tuple[Path, Path]]:
-    pairs = []
-    for image_path in sorted(image_dir.glob("*.jpg")):
-        label_path = label_dir / f"{image_path.stem}.json"
-        if label_path.exists():
-            pairs.append((image_path, label_path))
-    return pairs
+def resolve_dataset_roots(args: argparse.Namespace) -> list[Path]:
+    raw_roots = []
+    list_roots = getattr(args, "dataset_roots", None)
+    repeated_roots = getattr(args, "dataset_root", None)
+    if list_roots:
+        raw_roots.extend(list_roots)
+    if repeated_roots:
+        raw_roots.extend(repeated_roots)
+    if not raw_roots:
+        raw_roots = ["/home/slomauh/Downloads/data1"]
+
+    resolved = []
+    seen = set()
+    for root in raw_roots:
+        path = Path(root).expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        resolved.append(path)
+    return resolved
+
+
+def collect_pairs(dataset_roots: list[Path]) -> tuple[list[tuple[Path, Path]], int]:
+    pairs_by_stem: dict[str, tuple[Path, Path]] = {}
+    duplicate_count = 0
+    for dataset_root in dataset_roots:
+        image_dir = dataset_root / "BEV" / "Data" / "Image"
+        label_dir = dataset_root / "BEV" / "Data" / "label"
+        for image_path in sorted(image_dir.glob("*.jpg")):
+            label_path = label_dir / f"{image_path.stem}.json"
+            if not label_path.exists():
+                continue
+            if image_path.stem in pairs_by_stem:
+                duplicate_count += 1
+                continue
+            pairs_by_stem[image_path.stem] = (image_path, label_path)
+    pairs = [pairs_by_stem[stem] for stem in sorted(pairs_by_stem, key=int)]
+    return pairs, duplicate_count
 
 
 def split_pairs(
