@@ -18,32 +18,51 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.detection.parking_slot_detector import ParkingSlotDetector
 from src.detection.schemas import ParkingSlot
-from src.occupancy.classifier import EfficientNetOccupancyClassifier
+from src.occupancy.classifier import EfficientNetOccupancyClassifier, crop_slot_bbox
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate current pipeline on ParkRecon3D BEV images")
     parser.add_argument("--dataset-root", default="/home/slomauh/Downloads/data1")
-    parser.add_argument("--limit", type=int, default=30)
+    parser.add_argument("--image-dir", help="Optional direct directory with BEV images")
+    parser.add_argument("--label-dir", help="Optional direct directory with ParkRecon3D slot labels")
+    parser.add_argument("--limit", type=int, help="Optional number of images to evaluate")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--slot-model-path", default="/home/slomauh/pretrain_model/pretrain_model/1:2.pth")
     parser.add_argument("--slot-external-repo-path", default="external/CRPS-D")
     parser.add_argument("--slot-conf", type=float, default=0.40)
+    parser.add_argument("--slot-pairing-strategy", choices=["crpsd", "relaxed"], default="crpsd")
+    parser.add_argument("--slot-pairing-distance-scale", type=float, default=1.0)
+    parser.add_argument("--slot-max-point-degree", type=int, default=0)
+    parser.add_argument("--slot-min-score", type=float, default=0.0)
+    parser.add_argument("--slot-nms-iou", type=float, default=0.0)
+    parser.add_argument("--slot-geometry-filter", action="store_true")
+    parser.add_argument("--slot-min-area-ratio", type=float, default=0.0)
+    parser.add_argument("--slot-max-area-ratio", type=float, default=1.0)
+    parser.add_argument("--slot-max-aspect-ratio", type=float, default=0.0)
+    parser.add_argument("--slot-max-out-of-frame-ratio", type=float, default=1.0)
+    parser.add_argument("--slot-orientation-filter", action="store_true")
+    parser.add_argument("--slot-orientation-neighbor-radius", type=float, default=130.0)
+    parser.add_argument("--slot-orientation-min-neighbors", type=int, default=2)
+    parser.add_argument("--slot-orientation-angle-threshold", type=float, default=60.0)
     parser.add_argument("--detector-input-size", type=int, help="Resize BEV frame to NxN before slot detection")
     parser.add_argument("--occupancy-model-path", default="models/occupancy/efficientnet_b0_crpsd.pt")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--occupancy-threshold", type=float, default=0.50)
+    parser.add_argument("--low-confidence-threshold", type=float, default=0.70)
     parser.add_argument("--match-iou", type=float, default=0.10)
     parser.add_argument("--output-dir", default="outputs/parkrecon3d_bev_pipeline_test")
     parser.add_argument("--preview-limit", type=int, default=30)
+    parser.add_argument("--qa-crop-size", type=int, default=224)
+    parser.add_argument("--contact-sheet-limit", type=int, default=60)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     dataset_root = Path(args.dataset_root)
-    image_dir = dataset_root / "BEV" / "Data" / "Image"
-    label_dir = dataset_root / "BEV" / "Data" / "label"
+    image_dir = Path(args.image_dir) if args.image_dir else dataset_root / "BEV" / "Data" / "Image"
+    label_dir = Path(args.label_dir) if args.label_dir else dataset_root / "BEV" / "Data" / "label"
     image_paths = sorted(image_dir.glob("*.jpg"))
     if not image_paths:
         raise FileNotFoundError(f"No BEV images found in {image_dir}")
@@ -56,6 +75,13 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     preview_dir = output_dir / "preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
+    crop_dirs = {
+        "free": output_dir / "crops" / "free",
+        "occupied": output_dir / "crops" / "occupied",
+        "low_confidence": output_dir / "crops" / "low_confidence",
+    }
+    for crop_dir in crop_dirs.values():
+        crop_dir.mkdir(parents=True, exist_ok=True)
 
     slot_detector = ParkingSlotDetector(
         {
@@ -65,6 +91,20 @@ def main() -> None:
             "device": args.device,
             "conf_threshold": args.slot_conf,
             "depth_factor": 32,
+            "slot_pairing_strategy": args.slot_pairing_strategy,
+            "pairing_distance_scale": args.slot_pairing_distance_scale,
+            "max_point_degree": args.slot_max_point_degree,
+            "min_slot_score": args.slot_min_score,
+            "slot_nms_iou": args.slot_nms_iou,
+            "geometry_filter_enabled": args.slot_geometry_filter,
+            "min_slot_area_ratio": args.slot_min_area_ratio,
+            "max_slot_area_ratio": args.slot_max_area_ratio,
+            "max_slot_aspect_ratio": args.slot_max_aspect_ratio,
+            "max_out_of_frame_ratio": args.slot_max_out_of_frame_ratio,
+            "orientation_filter_enabled": args.slot_orientation_filter,
+            "orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
+            "orientation_min_neighbors": args.slot_orientation_min_neighbors,
+            "orientation_angle_threshold": args.slot_orientation_angle_threshold,
         }
     )
     classifier = EfficientNetOccupancyClassifier(
@@ -80,6 +120,8 @@ def main() -> None:
     records = []
     counts: Counter[str] = Counter()
     pred_status_counts: Counter[str] = Counter()
+    crop_bucket_counts: Counter[str] = Counter()
+    confidence_bins: Counter[str] = Counter()
     preview_written = 0
 
     for image_path in tqdm(image_paths, desc="Evaluating ParkRecon3D BEV"):
@@ -129,10 +171,40 @@ def main() -> None:
             pred_status, _ = occupancy_predictions.get(pred_slot.slot_id, ("unknown", 0.0))
             pred_status_counts[pred_status] += 1
 
+        predicted_slot_records = []
+        for pred_slot in pred_slots:
+            pred_status, confidence = occupancy_predictions.get(pred_slot.slot_id, ("unknown", 0.0))
+            bucket = occupancy_bucket(pred_status, confidence, args.low_confidence_threshold)
+            confidence_bins[confidence_bin(confidence)] += 1
+            crop_bucket_counts[bucket] += 1
+            crop_path = save_qa_crop(
+                frame,
+                pred_slot,
+                image_path.stem,
+                pred_status,
+                confidence,
+                bucket,
+                crop_dirs[bucket],
+                args.qa_crop_size,
+                pred_slot.slot_id in matched_pred_ids,
+            )
+            predicted_slot_records.append(
+                {
+                    "pred_slot_id": pred_slot.slot_id,
+                    "pred_status": pred_status,
+                    "pred_status_confidence": confidence,
+                    "qa_bucket": bucket,
+                    "crop_path": str(crop_path),
+                    "matched": pred_slot.slot_id in matched_pred_ids,
+                    "points": [[float(x), float(y)] for x, y in pred_slot.points],
+                }
+            )
+
         records.append(
             {
                 "image": str(image_path),
                 "matches": image_matches,
+                "predicted_slots": predicted_slot_records,
                 "false_negative_slot_ids": [slot.slot_id for slot in false_negative_slots],
                 "false_positive_slot_ids": [slot.slot_id for slot in false_positive_slots],
             }
@@ -148,18 +220,62 @@ def main() -> None:
         "image_dir": str(image_dir),
         "slot_model_path": args.slot_model_path,
         "slot_conf": args.slot_conf,
+        "slot_pairing_strategy": args.slot_pairing_strategy,
+        "slot_pairing_distance_scale": args.slot_pairing_distance_scale,
+        "slot_max_point_degree": args.slot_max_point_degree,
+        "slot_min_score": args.slot_min_score,
+        "slot_nms_iou": args.slot_nms_iou,
+        "slot_geometry_filter": args.slot_geometry_filter,
+        "slot_min_area_ratio": args.slot_min_area_ratio,
+        "slot_max_area_ratio": args.slot_max_area_ratio,
+        "slot_max_aspect_ratio": args.slot_max_aspect_ratio,
+        "slot_max_out_of_frame_ratio": args.slot_max_out_of_frame_ratio,
+        "slot_orientation_filter": args.slot_orientation_filter,
+        "slot_orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
+        "slot_orientation_min_neighbors": args.slot_orientation_min_neighbors,
+        "slot_orientation_angle_threshold": args.slot_orientation_angle_threshold,
         "occupancy_model_path": args.occupancy_model_path,
         "occupancy_threshold": args.occupancy_threshold,
+        "low_confidence_threshold": args.low_confidence_threshold,
         "match_iou": args.match_iou,
         "counts": dict(counts),
         "pred_status_counts": dict(pred_status_counts),
+        "crop_bucket_counts": dict(crop_bucket_counts),
+        "confidence_bins": dict(sorted(confidence_bins.items())),
         "metrics": metrics,
         "preview_dir": str(preview_dir),
+        "crop_dirs": {name: str(path) for name, path in crop_dirs.items()},
+        "contact_sheets": {
+            "preview": str(output_dir / "contact_sheet.jpg"),
+            "free": str(output_dir / "crops_contact_sheet_free.jpg"),
+            "occupied": str(output_dir / "crops_contact_sheet_occupied.jpg"),
+            "low_confidence": str(output_dir / "crops_contact_sheet_low_confidence.jpg"),
+        },
         "note": "ParkRecon3D BEV labels contain slot geometry here, but no occupancy ground truth.",
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (output_dir / "qa_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / "predictions.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
+    make_contact_sheet(preview_dir, output_dir / "contact_sheet.jpg", args.contact_sheet_limit, tile_size=(192, 231))
+    make_contact_sheet(
+        crop_dirs["free"],
+        output_dir / "crops_contact_sheet_free.jpg",
+        args.contact_sheet_limit,
+        tile_size=(160, 160),
+    )
+    make_contact_sheet(
+        crop_dirs["occupied"],
+        output_dir / "crops_contact_sheet_occupied.jpg",
+        args.contact_sheet_limit,
+        tile_size=(160, 160),
+    )
+    make_contact_sheet(
+        crop_dirs["low_confidence"],
+        output_dir / "crops_contact_sheet_low_confidence.jpg",
+        args.contact_sheet_limit,
+        tile_size=(160, 160),
+    )
     print(json.dumps(summary, indent=2))
 
 
@@ -282,6 +398,79 @@ def build_metrics(counts: Counter[str]) -> dict[str, float]:
         "slot_recall": matched / max(1, gt_slots),
         "slot_precision": matched / max(1, pred_slots),
     }
+
+
+def occupancy_bucket(status: str, confidence: float, low_confidence_threshold: float) -> str:
+    if confidence < low_confidence_threshold:
+        return "low_confidence"
+    if status == "occupied":
+        return "occupied"
+    return "free"
+
+
+def confidence_bin(confidence: float) -> str:
+    lower = int(max(0.0, min(0.999, confidence)) * 10) * 10
+    upper = lower + 10
+    return f"{lower:02d}-{upper:02d}"
+
+
+def save_qa_crop(
+    frame,
+    slot: ParkingSlot,
+    image_stem: str,
+    status: str,
+    confidence: float,
+    bucket: str,
+    output_dir: Path,
+    crop_size: int,
+    matched: bool,
+) -> Path:
+    crop = crop_slot_bbox(frame, slot, crop_size)
+    filename = (
+        f"{image_stem}_slot{slot.slot_id:03d}_{status}_{confidence:.3f}_"
+        f"{'matched' if matched else 'fp'}.jpg"
+    )
+    crop_path = output_dir / filename
+    label = f"{bucket} {status} {confidence:.2f}"
+    cv2.rectangle(crop, (0, 0), (crop.shape[1] - 1, 22), (0, 0, 0), -1)
+    cv2.putText(crop, label, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.imwrite(str(crop_path), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return crop_path
+
+
+def make_contact_sheet(input_dir: Path, output_path: Path, limit: int, tile_size: tuple[int, int]) -> None:
+    image_paths = sorted(input_dir.glob("*.jpg"))[:limit]
+    if not image_paths:
+        return
+
+    columns = 6
+    tiles = []
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path))
+        if image is None:
+            continue
+        tile = cv2.resize(image, tile_size, interpolation=cv2.INTER_AREA)
+        cv2.putText(
+            tile,
+            image_path.stem[:24],
+            (4, tile.shape[0] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.32,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        tiles.append(tile)
+
+    if not tiles:
+        return
+
+    blank = np.zeros_like(tiles[0])
+    while len(tiles) % columns:
+        tiles.append(blank.copy())
+    rows = [cv2.hconcat(tiles[index : index + columns]) for index in range(0, len(tiles), columns)]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), cv2.vconcat(rows), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
 
 def draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions):

@@ -25,13 +25,42 @@ vehicle_detector:
   imgsz: 640
 
 parking_slot_detector:
-  backend: "mock"  # mock | crpsd
-  model_path: "/home/slomauh/pretrain_model/pretrain_model/1:2.pth"
+  backend: "crpsd"  # mock | crpsd
+  model_path: "models/slot_detector/parkrecon3d_slot_detector_finetuned.pth"
   external_repo_path: "external/CRPS-D"
   device: "cpu"
   depth_factor: 32
-  conf_threshold: 0.40
+  conf_threshold: 0.30
   imgsz: 512
+  slot_pairing_strategy: "relaxed"  # crpsd | relaxed
+  pairing_distance_scale: 1.0
+  max_point_degree: 2
+  min_slot_score: 0.35
+  slot_nms_iou: 0.0
+  geometry_filter_enabled: false
+  min_slot_area_ratio: 0.0
+  max_slot_area_ratio: 1.0
+  max_slot_aspect_ratio: 0.0
+  max_out_of_frame_ratio: 1.0
+  orientation_filter_enabled: false
+  orientation_neighbor_radius: 130.0
+  orientation_min_neighbors: 2
+  orientation_angle_threshold: 60.0
+
+temporal_slot_smoothing:
+  enabled: true
+  mode: "quality_fill_gap"
+  window: 5
+  min_hits: 2
+  max_missing: 4
+  track_iou: 0.10
+  max_center_distance: 45.0
+  min_track_score: 0.50
+  min_track_age: 2
+  min_consecutive_hits: 2
+  fill_gap_min_confidence: 0.45
+  decay_on_miss: 0.85
+  max_gap_fill: 1
 
 tracker:
   type: "bytetrack"
