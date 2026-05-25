@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from shapely.geometry import Polygon as ShapelyPolygon
 
 from src.detection.schemas import ParkingSlot
 
@@ -27,11 +28,27 @@ class ParkingSlotDetector:
         self.conf_threshold = float(config.get("conf_threshold", 0.30))
         self.depth_factor = int(config.get("depth_factor", 32))
         self.external_repo_path = Path(config.get("external_repo_path", "external/CRPS-D")).resolve()
+        self.slot_pairing_strategy = str(config.get("slot_pairing_strategy", "crpsd")).lower()
+        self.pairing_distance_scale = float(config.get("pairing_distance_scale", 1.0))
+        self.max_point_degree = int(config.get("max_point_degree", 0))
+        self.min_slot_score = float(config.get("min_slot_score", 0.0))
+        self.slot_nms_iou = float(config.get("slot_nms_iou", 0.0))
+        self.geometry_filter_enabled = bool(config.get("geometry_filter_enabled", False))
+        self.min_slot_area_ratio = float(config.get("min_slot_area_ratio", 0.0))
+        self.max_slot_area_ratio = float(config.get("max_slot_area_ratio", 1.0))
+        self.max_slot_aspect_ratio = float(config.get("max_slot_aspect_ratio", 0.0))
+        self.max_out_of_frame_ratio = float(config.get("max_out_of_frame_ratio", 1.0))
+        self.orientation_filter_enabled = bool(config.get("orientation_filter_enabled", False))
+        self.orientation_neighbor_radius = float(config.get("orientation_neighbor_radius", 130.0))
+        self.orientation_min_neighbors = int(config.get("orientation_min_neighbors", 2))
+        self.orientation_angle_threshold = float(config.get("orientation_angle_threshold", 60.0))
         self.model = None
         self._crpsd = None
 
         if self.backend not in {"mock", "crpsd"}:
             raise ValueError(f"Unsupported parking slot detector backend: {self.backend}")
+        if self.slot_pairing_strategy not in {"crpsd", "relaxed"}:
+            raise ValueError(f"Unsupported slot pairing strategy: {self.slot_pairing_strategy}")
 
     def detect(self, frame: np.ndarray) -> list[ParkingSlot]:
         if self.backend == "crpsd":
@@ -70,9 +87,22 @@ class ParkingSlotDetector:
         if not pred_points:
             return []
 
+        return self._convert_pred_points_to_slots(frame, pred_points)
+
+    def _convert_pred_points_to_slots(self, frame: np.ndarray, pred_points: list) -> list[ParkingSlot]:
+        if not pred_points:
+            return []
+
         marking_points = list(list(zip(*pred_points))[1])
-        raw_slots = modules["inference_slots"](marking_points)
-        return self._convert_crpsd_slots(frame, marking_points, raw_slots)
+        point_confidences = [float(item[0]) for item in pred_points]
+        if self.slot_pairing_strategy == "relaxed":
+            raw_slots = self._infer_crpsd_slots_relaxed(marking_points)
+        else:
+            assert self._crpsd is not None
+            raw_slots = self._crpsd["inference_slots"](marking_points)
+        raw_slots = self._postprocess_raw_slots(marking_points, raw_slots)
+        slots = self._convert_crpsd_slots(frame, marking_points, raw_slots, point_confidences)
+        return self._postprocess_slots(frame, slots)
 
     def _load_crpsd_model(self) -> None:
         if self.model is not None:
@@ -91,6 +121,7 @@ class ParkingSlotDetector:
 
         import config as crpsd_config
         from inference import detect_marking_points, inference_slots
+        from data.process import pair_marking_points, pair_marking_points_slant, pair_marking_points_vertical
         from model import TeacherDetector
 
         device = torch.device(self.device_name if torch.cuda.is_available() or self.device_name == "cpu" else "cpu")
@@ -104,10 +135,104 @@ class ParkingSlotDetector:
             "config": crpsd_config,
             "detect_marking_points": detect_marking_points,
             "inference_slots": inference_slots,
+            "pair_marking_points": pair_marking_points,
+            "pair_marking_points_slant": pair_marking_points_slant,
+            "pair_marking_points_vertical": pair_marking_points_vertical,
             "device": device,
         }
 
-    def _convert_crpsd_slots(self, frame: np.ndarray, marking_points: list, raw_slots: list) -> list[ParkingSlot]:
+    def _infer_crpsd_slots_relaxed(self, marking_points: list) -> list[tuple[int, int, float]]:
+        """CRPS-D slot pairing without pass-through-third-point suppression."""
+        if self._crpsd is None:
+            return []
+        crpsd_config = self._crpsd["config"]
+        slots: list[tuple[int, int, float]] = []
+        for i in range(len(marking_points) - 1):
+            for j in range(i + 1, len(marking_points)):
+                point_i = marking_points[i]
+                point_j = marking_points[j]
+                distance = self._crpsd_calc_point_square_dist(point_i, point_j)
+                use_slant = False
+                use_vertical = False
+
+                if point_i.type < 0.5 < point_j.type or point_j.type < 0.5 < point_i.type:
+                    use_slant = True
+                if use_slant and distance > self._scaled_max_dist(crpsd_config.SLANT_MAX_DIST):
+                    use_vertical = True
+                    use_slant = False
+
+                if point_i.type < 0.5:
+                    if not (
+                        self._scaled_min_dist(crpsd_config.VSLOT_MIN_DIST)
+                        <= distance
+                        <= self._scaled_max_dist(crpsd_config.VSLOT_MAX_DIST)
+                        or self._scaled_min_dist(crpsd_config.HSLOT_MIN_DIST)
+                        <= distance
+                        <= self._scaled_max_dist(crpsd_config.HSLOT_MAX_DIST)
+                        or use_vertical
+                    ):
+                        continue
+                elif not (
+                    self._scaled_min_dist(crpsd_config.SLANT_MIN_DIST)
+                    <= distance
+                    <= self._scaled_max_dist(crpsd_config.SLANT_MAX_DIST)
+                    or use_vertical
+                ):
+                    continue
+
+                result = self._crpsd["pair_marking_points"](point_i, point_j)
+                if use_slant:
+                    result = self._crpsd["pair_marking_points_slant"](point_i, point_j)
+                if use_vertical:
+                    result = self._crpsd["pair_marking_points_vertical"](point_i, point_j)
+
+                if result[0] == 1:
+                    slots.append((i, j, result[1]))
+                elif result[0] == -1:
+                    slots.append((j, i, result[1]))
+        return slots
+
+    def _postprocess_raw_slots(self, marking_points: list, raw_slots: list) -> list:
+        if self.max_point_degree <= 0 or len(raw_slots) < 3:
+            return raw_slots
+
+        ordered_slots = sorted(raw_slots, key=lambda raw_slot: self._raw_slot_bridge_length(marking_points, raw_slot))
+        point_degrees: dict[int, int] = {}
+        kept_slots = []
+        for raw_slot in ordered_slots:
+            point_a_idx = int(raw_slot[0])
+            point_b_idx = int(raw_slot[1])
+            if point_degrees.get(point_a_idx, 0) >= self.max_point_degree:
+                continue
+            if point_degrees.get(point_b_idx, 0) >= self.max_point_degree:
+                continue
+            point_degrees[point_a_idx] = point_degrees.get(point_a_idx, 0) + 1
+            point_degrees[point_b_idx] = point_degrees.get(point_b_idx, 0) + 1
+            kept_slots.append(raw_slot)
+        return kept_slots
+
+    def _raw_slot_bridge_length(self, marking_points: list, raw_slot: tuple[int, int, float]) -> float:
+        point_a = marking_points[raw_slot[0]]
+        point_b = marking_points[raw_slot[1]]
+        return self._crpsd_calc_point_square_dist(point_a, point_b)
+
+    def _scaled_min_dist(self, value: float) -> float:
+        if self._crpsd is None:
+            return value
+        return (value / self.pairing_distance_scale) * self._crpsd["config"].SQUARED_RATIO
+
+    def _scaled_max_dist(self, value: float) -> float:
+        if self._crpsd is None:
+            return value
+        return (value * self.pairing_distance_scale) * self._crpsd["config"].SQUARED_RATIO
+
+    def _convert_crpsd_slots(
+        self,
+        frame: np.ndarray,
+        marking_points: list,
+        raw_slots: list,
+        point_confidences: list[float] | None = None,
+    ) -> list[ParkingSlot]:
         if self._crpsd is None:
             return []
         crpsd_config = self._crpsd["config"]
@@ -144,12 +269,144 @@ class ParkingSlotDetector:
                 ParkingSlot(
                     slot_id=slot_id,
                     points=[(p0_x, p0_y), (p1_x, p1_y), (p3_x, p3_y), (p2_x, p2_y)],
-                    confidence=1.0,
+                    confidence=self._raw_slot_score(point_confidences, raw_slot),
                     type=slot_type,
                 )
             )
 
         return slots
+
+    def _raw_slot_score(self, point_confidences: list[float] | None, raw_slot: tuple[int, int, float]) -> float:
+        if point_confidences is None:
+            return 1.0
+        point_a_idx = int(raw_slot[0])
+        point_b_idx = int(raw_slot[1])
+        if point_a_idx >= len(point_confidences) or point_b_idx >= len(point_confidences):
+            return 1.0
+        return float(math.sqrt(max(0.0, point_confidences[point_a_idx]) * max(0.0, point_confidences[point_b_idx])))
+
+    def _postprocess_slots(self, frame: np.ndarray, slots: list[ParkingSlot]) -> list[ParkingSlot]:
+        if not slots:
+            return []
+
+        kept = [slot for slot in slots if slot.confidence >= self.min_slot_score]
+        if self.geometry_filter_enabled:
+            kept = [slot for slot in kept if self._slot_geometry_is_valid(frame, slot)]
+        if self.slot_nms_iou > 0:
+            kept = self._slot_polygon_nms(kept, self.slot_nms_iou)
+        if self.orientation_filter_enabled:
+            kept = self._filter_orientation_outliers(kept)
+
+        return [
+            ParkingSlot(
+                slot_id=slot_id,
+                points=slot.points,
+                confidence=slot.confidence,
+                type=slot.type,
+                occupancy_label=slot.occupancy_label,
+            )
+            for slot_id, slot in enumerate(kept, start=1)
+        ]
+
+    def _slot_geometry_is_valid(self, frame: np.ndarray, slot: ParkingSlot) -> bool:
+        polygon = self._make_polygon(slot.points)
+        if polygon is None:
+            return False
+
+        height, width = frame.shape[:2]
+        image_area = max(1.0, float(width * height))
+        area_ratio = float(polygon.area) / image_area
+        if area_ratio < self.min_slot_area_ratio or area_ratio > self.max_slot_area_ratio:
+            return False
+
+        if self.max_slot_aspect_ratio > 0:
+            points = np.array(slot.points, dtype=np.float32)
+            side_lengths = [
+                float(np.linalg.norm(points[(idx + 1) % len(points)] - points[idx]))
+                for idx in range(len(points))
+            ]
+            nonzero_lengths = [length for length in side_lengths if length > 1e-6]
+            if not nonzero_lengths:
+                return False
+            aspect_ratio = max(nonzero_lengths) / max(1e-6, min(nonzero_lengths))
+            if aspect_ratio > self.max_slot_aspect_ratio:
+                return False
+
+        frame_polygon = ShapelyPolygon([(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)])
+        inside_area = polygon.intersection(frame_polygon).area
+        out_of_frame_ratio = 1.0 - float(inside_area / max(1e-6, polygon.area))
+        return out_of_frame_ratio <= self.max_out_of_frame_ratio
+
+    def _slot_polygon_nms(self, slots: list[ParkingSlot], iou_threshold: float) -> list[ParkingSlot]:
+        ordered_slots = sorted(slots, key=lambda slot: slot.confidence, reverse=True)
+        kept: list[ParkingSlot] = []
+        kept_polygons = []
+        for slot in ordered_slots:
+            polygon = self._make_polygon(slot.points)
+            if polygon is None:
+                continue
+            if any(self._polygon_iou(polygon, kept_polygon) >= iou_threshold for kept_polygon in kept_polygons):
+                continue
+            kept.append(slot)
+            kept_polygons.append(polygon)
+        return kept
+
+    def _filter_orientation_outliers(self, slots: list[ParkingSlot]) -> list[ParkingSlot]:
+        if len(slots) < self.orientation_min_neighbors + 1:
+            return slots
+
+        centers = [self._slot_center(slot) for slot in slots]
+        bridge_angles = [self._slot_bridge_angle(slot) for slot in slots]
+        suppressed = set()
+        for idx, slot in enumerate(slots):
+            neighbors = []
+            for other_idx, other_slot in enumerate(slots):
+                if idx == other_idx:
+                    continue
+                if float(np.linalg.norm(centers[idx] - centers[other_idx])) <= self.orientation_neighbor_radius:
+                    neighbors.append(other_idx)
+            if len(neighbors) < self.orientation_min_neighbors:
+                continue
+
+            angle_diffs = [self._axial_angle_diff_degrees(bridge_angles[idx], bridge_angles[other_idx]) for other_idx in neighbors]
+            median_diff = float(np.median(angle_diffs))
+            neighbor_confidence = float(np.median([slots[other_idx].confidence for other_idx in neighbors]))
+            if median_diff >= self.orientation_angle_threshold and slot.confidence <= neighbor_confidence:
+                suppressed.add(idx)
+
+        return [slot for idx, slot in enumerate(slots) if idx not in suppressed]
+
+    @staticmethod
+    def _slot_center(slot: ParkingSlot) -> np.ndarray:
+        return np.mean(np.array(slot.points, dtype=np.float32), axis=0)
+
+    @staticmethod
+    def _slot_bridge_angle(slot: ParkingSlot) -> float:
+        points = np.array(slot.points, dtype=np.float32)
+        vector = points[1] - points[0]
+        return float(math.atan2(vector[1], vector[0]))
+
+    @staticmethod
+    def _axial_angle_diff_degrees(angle_a: float, angle_b: float) -> float:
+        diff = abs((angle_a - angle_b + math.pi) % (2 * math.pi) - math.pi)
+        diff = min(diff, math.pi - diff)
+        return math.degrees(diff)
+
+    @staticmethod
+    def _make_polygon(points) -> ShapelyPolygon | None:
+        polygon = ShapelyPolygon(points)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty or polygon.area <= 0:
+            return None
+        return polygon
+
+    @staticmethod
+    def _polygon_iou(polygon_a: ShapelyPolygon, polygon_b: ShapelyPolygon) -> float:
+        union = polygon_a.union(polygon_b).area
+        if union <= 0:
+            return 0.0
+        return float(polygon_a.intersection(polygon_b).area / union)
 
     @staticmethod
     def _crpsd_calc_point_square_dist(point_a, point_b) -> float:

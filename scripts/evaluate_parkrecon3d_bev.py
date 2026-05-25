@@ -31,6 +31,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-model-path", default="/home/slomauh/pretrain_model/pretrain_model/1:2.pth")
     parser.add_argument("--slot-external-repo-path", default="external/CRPS-D")
     parser.add_argument("--slot-conf", type=float, default=0.40)
+    parser.add_argument("--slot-pairing-strategy", choices=["crpsd", "relaxed"], default="crpsd")
+    parser.add_argument("--slot-pairing-distance-scale", type=float, default=1.0)
+    parser.add_argument("--slot-max-point-degree", type=int, default=0)
+    parser.add_argument("--slot-min-score", type=float, default=0.0)
+    parser.add_argument("--slot-nms-iou", type=float, default=0.0)
+    parser.add_argument("--slot-geometry-filter", action="store_true")
+    parser.add_argument("--slot-min-area-ratio", type=float, default=0.0)
+    parser.add_argument("--slot-max-area-ratio", type=float, default=1.0)
+    parser.add_argument("--slot-max-aspect-ratio", type=float, default=0.0)
+    parser.add_argument("--slot-max-out-of-frame-ratio", type=float, default=1.0)
+    parser.add_argument("--slot-orientation-filter", action="store_true")
+    parser.add_argument("--slot-orientation-neighbor-radius", type=float, default=130.0)
+    parser.add_argument("--slot-orientation-min-neighbors", type=int, default=2)
+    parser.add_argument("--slot-orientation-angle-threshold", type=float, default=60.0)
     parser.add_argument("--detector-input-size", type=int, help="Resize BEV frame to NxN before slot detection")
     parser.add_argument("--occupancy-model-path", default="models/occupancy/efficientnet_b0_crpsd.pt")
     parser.add_argument("--device", default="cpu")
@@ -77,6 +91,20 @@ def main() -> None:
             "device": args.device,
             "conf_threshold": args.slot_conf,
             "depth_factor": 32,
+            "slot_pairing_strategy": args.slot_pairing_strategy,
+            "pairing_distance_scale": args.slot_pairing_distance_scale,
+            "max_point_degree": args.slot_max_point_degree,
+            "min_slot_score": args.slot_min_score,
+            "slot_nms_iou": args.slot_nms_iou,
+            "geometry_filter_enabled": args.slot_geometry_filter,
+            "min_slot_area_ratio": args.slot_min_area_ratio,
+            "max_slot_area_ratio": args.slot_max_area_ratio,
+            "max_slot_aspect_ratio": args.slot_max_aspect_ratio,
+            "max_out_of_frame_ratio": args.slot_max_out_of_frame_ratio,
+            "orientation_filter_enabled": args.slot_orientation_filter,
+            "orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
+            "orientation_min_neighbors": args.slot_orientation_min_neighbors,
+            "orientation_angle_threshold": args.slot_orientation_angle_threshold,
         }
     )
     classifier = EfficientNetOccupancyClassifier(
@@ -192,6 +220,20 @@ def main() -> None:
         "image_dir": str(image_dir),
         "slot_model_path": args.slot_model_path,
         "slot_conf": args.slot_conf,
+        "slot_pairing_strategy": args.slot_pairing_strategy,
+        "slot_pairing_distance_scale": args.slot_pairing_distance_scale,
+        "slot_max_point_degree": args.slot_max_point_degree,
+        "slot_min_score": args.slot_min_score,
+        "slot_nms_iou": args.slot_nms_iou,
+        "slot_geometry_filter": args.slot_geometry_filter,
+        "slot_min_area_ratio": args.slot_min_area_ratio,
+        "slot_max_area_ratio": args.slot_max_area_ratio,
+        "slot_max_aspect_ratio": args.slot_max_aspect_ratio,
+        "slot_max_out_of_frame_ratio": args.slot_max_out_of_frame_ratio,
+        "slot_orientation_filter": args.slot_orientation_filter,
+        "slot_orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
+        "slot_orientation_min_neighbors": args.slot_orientation_min_neighbors,
+        "slot_orientation_angle_threshold": args.slot_orientation_angle_threshold,
         "occupancy_model_path": args.occupancy_model_path,
         "occupancy_threshold": args.occupancy_threshold,
         "low_confidence_threshold": args.low_confidence_threshold,
