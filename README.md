@@ -2,28 +2,38 @@
 
 Проект для детекции парковочных мест на surround-view / BEV изображениях и определения статуса занятости места.
 
-Текущая идея пайплайна:
+Текущий рабочий пайплайн:
 
 ```text
-кадр / видео
-  -> детектор парковочных мест
-  -> кроп каждого места
-  -> EfficientNet-B0 классификатор free / occupied
-  -> визуализация и JSON-результат
+кадр / последовательность кадров
+  -> detector парковочных мест
+  -> crop каждого найденного места
+  -> EfficientNet-B0 classifier free / occupied
+  -> preview, JSON, галереи crops, видео
 ```
 
 ## Текущее состояние
 
-Сейчас в репозитории есть рабочий MVP:
+Главный вывод после последних экспериментов: CRPS-D marking-point detector оказался ограничен pairing/postprocess логикой, а YOLO-OBB на ParkRecon3D BEV резко поднял качество. Поэтому основной кандидат на slot detector сейчас - YOLO-OBB, который сразу предсказывает повернутый четырехугольник парковочного места.
+
+В репозитории есть:
 
 - базовый video pipeline в `src/main.py`;
-- YOLO vehicle detector, но для surround-view он оказался слабым и не является основным решением;
-- адаптер pretrained CRPS-D parking-slot detector;
+- CRPS-D slot detector backend как baseline/fallback;
+- YOLO-OBB slot detector backend;
 - EfficientNet-B0 occupancy classifier;
-- скрипты для подготовки датасетов, обучения occupancy classifier и оценки результатов;
-- конвертер ParkRecon3D BEV в CRPS-D-like формат для будущего дообучения детектора парковочных мест.
+- конвертеры ParkRecon3D BEV в CRPS-D-like и YOLO-OBB форматы;
+- evaluation/QA скрипты для CRPS-D, ParkRecon3D BEV, temporal sequence и полного pipeline;
+- Kaggle-инструкции для обучения CRPS-D fine-tune и YOLO-OBB.
 
-Главный вывод по экспериментам: классификатор занятости работает хорошо, а основная проблема сейчас в переносе детектора парковочных мест на другой BEV-домен.
+Текущий лучший практический путь:
+
+```text
+ParkRecon3D BEV
+  -> YOLO-OBB slot detector, conf около 0.55
+  -> EfficientNet-B0 occupancy classifier
+  -> visual QA / JSON / video
+```
 
 ## Примеры
 
@@ -35,78 +45,76 @@
 
 ![CRPS-D occupancy](docs/assets/crpsd_occupancy_example.jpg)
 
-### ParkRecon3D BEV, текущий перенос CRPS-D detector
+### ParkRecon3D BEV
 
 ![ParkRecon3D BEV](docs/assets/parkrecon3d_bev_example.jpg)
-
-На ParkRecon3D BEV видно, что домен отличается от CRPS-D: текущий detector находит мало слотов, поэтому следующий важный этап - fine-tune slot detector на ParkRecon3D BEV.
 
 ## Структура проекта
 
 ```text
 configs/
-  default.yaml                         # основной конфиг пайплайна
+  default.yaml
 
 src/
-  main.py                              # запуск video pipeline
+  main.py
   detection/
-    parking_slot_detector.py           # mock / CRPS-D slot detector
-    vehicle_detector.py                # YOLO vehicle detector
-    schemas.py                         # dataclass-схемы
+    parking_slot_detector.py       # mock / CRPS-D / YOLO-OBB slot detector
+    vehicle_detector.py            # YOLO vehicle detector
+    schemas.py
   occupancy/
-    classifier.py                      # EfficientNet-B0 classifier
-    estimator.py                       # выбор geometry / classifier backend
-    state_manager.py                   # temporal smoothing для видео
+    classifier.py                  # EfficientNet-B0 classifier
+    estimator.py
+    state_manager.py
   datasets/
-    crpsd.py                           # парсер CRPS-D labels
+    crpsd.py
   visualization/
-    draw.py                            # отрисовка результатов
+    draw.py
 
 scripts/
-  train_occupancy_efficientnet.py      # обучение EfficientNet-B0
-  visualize_crpsd_occupancy.py         # нарезка occupancy crops из CRPS-D
+  train_occupancy_efficientnet.py
   evaluate_occupancy_classifier_crpsd.py
   evaluate_full_pipeline_crpsd.py
   evaluate_parkrecon3d_bev.py
+  evaluate_parkrecon3d_temporal_slots.py
   convert_parkrecon3d_bev.py
+  convert_parkrecon3d_yolo_obb.py
   prepare_parkrecon3d_camera_images.py
-  test_parking_slot_detector_crpsd.py
-  test_vehicle_detector_crpsd.py
+  visualize_parkrecon3d_resized_labels.py
 
-docs/assets/
-  *.jpg                                # примеры работы для README
+docs/
+  kaggle_yolo_obb.md
+  kaggle_slot_detector_finetune.md
+  parkrecon3d_camera_projection.md
+  assets/
 ```
 
 ## Что не хранится в git
 
 Большие файлы игнорируются:
 
-- `models/**/*.pt`
-- `outputs/`
-- `external/`
-- `data/raw/`
-- `data/processed/`
-- `data/samples/*.mp4`
+```text
+models/**/*.pt
+models/**/*.pth
+outputs/
+external/
+data/raw/
+data/processed/
+data/samples/*.mp4
+```
 
-Их нужно положить локально руками.
-
-Сейчас использовались такие веса:
+Локально сейчас использовались такие веса:
 
 ```text
 models/vehicle/yolo11n.pt
 models/occupancy/efficientnet_b0_crpsd.pt
-/home/slomauh/pretrain_model/pretrain_model/1:2.pth
+models/slot_detector/best_yolo_parkrecon.pt
+models/slot_detector/parkrecon3d_slot_detector_finetuned.pth
 ```
 
-Для CRPS-D detector также нужен внешний репозиторий:
+Для CRPS-D backend нужен внешний репозиторий:
 
 ```text
 external/CRPS-D
-```
-
-Он соответствует проекту:
-
-```text
 https://github.com/zzh362/CRPS-D
 ```
 
@@ -120,29 +128,33 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Если нужен CRPS-D detector:
+Если нужен CRPS-D backend:
 
 ```bash
 mkdir -p external
 git clone https://github.com/zzh362/CRPS-D external/CRPS-D
 ```
 
-Потом положить веса:
+Для YOLO-OBB нужен пакет `ultralytics`. Если его нет после установки requirements:
 
-```text
-models/occupancy/efficientnet_b0_crpsd.pt
-models/vehicle/yolo11n.pt
+```bash
+pip install ultralytics
 ```
 
-И указать путь к slot detector weights в `configs/default.yaml`:
+## Конфиг
+
+`configs/default.yaml` пока хранит CRPS-D/postprocess настройки как совместимый baseline. Для YOLO-OBB нужно переключить блок `parking_slot_detector` так:
 
 ```yaml
 parking_slot_detector:
-  backend: "crpsd"
-  model_path: "/path/to/1:2.pth"
+  backend: "yolo_obb"
+  model_path: "models/slot_detector/best_yolo_parkrecon.pt"
+  device: "cuda"
+  conf_threshold: 0.55
+  imgsz: 1024
 ```
 
-Сейчас в конфиге slot detector по умолчанию стоит `mock`, чтобы базовый pipeline мог запуститься без внешних весов.
+Если CUDA недоступна, использовать `device: "cpu"`.
 
 ## Запуск demo pipeline
 
@@ -150,7 +162,7 @@ parking_slot_detector:
 python src/main.py --config configs/default.yaml
 ```
 
-Если `data/samples/demo.mp4` отсутствует, код сам создаст простой synthetic demo video.
+Если `data/samples/demo.mp4` отсутствует, код создает synthetic demo video.
 
 Результаты:
 
@@ -161,7 +173,7 @@ outputs/json/demo_result.json
 
 ## Occupancy classifier
 
-Для статуса занятости используется EfficientNet-B0:
+Статус занятости считает EfficientNet-B0:
 
 ```text
 src/occupancy/classifier.py
@@ -180,9 +192,7 @@ occupied
 models/occupancy/efficientnet_b0_crpsd.pt
 ```
 
-### Проверка occupancy classifier на CRPS-D
-
-Оценка на GT-слотах CRPS-D test:
+Проверка на GT-слотах CRPS-D test:
 
 ```bash
 python scripts/evaluate_occupancy_classifier_crpsd.py \
@@ -193,7 +203,7 @@ python scripts/evaluate_occupancy_classifier_crpsd.py \
   --output-dir outputs/crpsd_occupancy_eval_test_full
 ```
 
-Полученный результат:
+Результат:
 
 ```text
 images: 4376
@@ -203,11 +213,11 @@ occupied_f1: 98.53%
 free_f1: 97.74%
 ```
 
-Вывод: классификатор занятости на CRPS-D работает хорошо.
+Вывод: classifier на CRPS-D работает хорошо. На ParkRecon3D BEV честной occupancy accuracy пока нет, потому что в датасете нет GT `free/occupied`.
 
-## Полная связка на CRPS-D
+## CRPS-D full pipeline
 
-Оценка:
+Оценка полной связки на CRPS-D:
 
 ```bash
 python scripts/evaluate_full_pipeline_crpsd.py \
@@ -234,11 +244,9 @@ matched_occupancy_accuracy: 98.00%
 end_to_end_slot_status_accuracy_over_gt: 82.02%
 ```
 
-Вывод: occupancy classifier остается сильным на найденных слотах, но end-to-end ограничен качеством slot detector.
+## ParkRecon3D BEV dataset
 
-## ParkRecon3D BEV
-
-ParkRecon3D был скачан локально сюда:
+ParkRecon3D был подготовлен из локальных частей:
 
 ```text
 /home/slomauh/Documents/data1
@@ -246,60 +254,25 @@ ParkRecon3D был скачан локально сюда:
 /home/slomauh/Documents/data3
 ```
 
-Для тестов брались только BEV-изображения:
+Используются BEV-изображения:
 
 ```text
 <dataset_part>/BEV/Data/Image
 <dataset_part>/BEV/Data/label
 ```
 
-В `label/*.json` есть геометрия слотов:
+В labels есть геометрия парковочных мест:
 
 ```json
 {
-  "marks": [[x0, y0, x1, y1, type], ...],
-  "slots": [[mark_a, mark_b, slot_type, angle], ...]
+  "marks": [[x0, y0, x1, y1, type]],
+  "slots": [[mark_a, mark_b, slot_type, angle]]
 }
 ```
 
-Важное ограничение: в этих labels нет ground truth статуса занятости. Поэтому на ParkRecon3D BEV можно честно оценивать slot detector, но нельзя честно считать accuracy occupancy classifier.
+Важное ограничение: в ParkRecon3D labels нет статуса занятости.
 
-### Текущая проверка на ParkRecon3D BEV
-
-```bash
-python scripts/evaluate_parkrecon3d_bev.py \
-  --dataset-root /home/slomauh/Documents/data1 \
-  --limit 30 \
-  --device cpu \
-  --slot-model-path /home/slomauh/pretrain_model/pretrain_model/1:2.pth \
-  --occupancy-model-path models/occupancy/efficientnet_b0_crpsd.pt \
-  --slot-conf 0.01 \
-  --detector-input-size 512 \
-  --match-iou 0.10 \
-  --output-dir outputs/parkrecon3d_bev_pipeline_test_resize512_conf001
-```
-
-Результат на 30 кадрах:
-
-```text
-gt_slots: 118
-pred_slots: 33
-matched_slots: 21
-slot_recall: 17.80%
-slot_precision: 63.64%
-```
-
-Вывод: CRPS-D detector плохо переносится на ParkRecon3D BEV без дообучения.
-
-## Конвертация ParkRecon3D BEV для дообучения detector
-
-Скрипт:
-
-```text
-scripts/convert_parkrecon3d_bev.py
-```
-
-Команда:
+Конвертация в CRPS-D-like формат:
 
 ```bash
 python scripts/convert_parkrecon3d_bev.py \
@@ -314,32 +287,7 @@ python scripts/convert_parkrecon3d_bev.py \
   --gap-size 30
 ```
 
-Что делает:
-
-- берет BEV images и labels из одной или нескольких частей ParkRecon3D;
-- удаляет дубли по timestamp/image id;
-- ресайзит изображения до `512x512`;
-- пересчитывает координаты marks;
-- создает raw CRPS-D-like формат для оценки;
-- создает prepared формат для train-кода из `external/CRPS-D`;
-- делает безопасный хронологический split, а не random split.
-
-Выход:
-
-```text
-outputs/parkrecon3d_bev_crpsd_format/
-  raw/
-    train/img/
-    train/slot_label/
-    test/img/
-    test/slot_label/
-  prepared/
-    train/
-    test/
-  summary.json
-```
-
-Текущий converted dataset:
+Текущий split:
 
 ```text
 total_pairs: 5005
@@ -351,7 +299,7 @@ test slots: 4786
 dropped gap frames: 30
 ```
 
-Проверка на утечки:
+Проверка leakage:
 
 ```text
 test with train neighbor <= 1 frame: 0/1001
@@ -362,31 +310,131 @@ dHash exact duplicates: 0
 dHash near duplicates up to 8/256 bits: 0
 ```
 
-Архив для загрузки в Kaggle:
+## CRPS-D detector на ParkRecon3D
+
+Изначальный pretrained CRPS-D detector без дообучения плохо переносился на ParkRecon3D BEV:
 
 ```text
-outputs/kaggle_parkrecon3d_bev_dataset/parkrecon3d_bev_crpsd_format.zip
+30-frame smoke:
+gt_slots: 118
+pred_slots: 33
+matched_slots: 21
+slot_recall: 17.80%
+slot_precision: 63.64%
 ```
 
-Размер примерно `1.2G`.
-
-Для fine-tune slot detector на Kaggle подготовлена отдельная инструкция:
+После fine-tune и большого числа postprocess экспериментов лучший CRPS-D-like вариант уперся примерно в:
 
 ```text
-docs/kaggle_slot_detector_finetune.md
+recall:    77.48%
+precision: 77.54%
+F1:        77.51%
 ```
 
-Нужно загрузить в Kaggle три zip-архива:
+Основная проблема: модель предсказывает marking points, а pairing/postprocess иногда собирает поперечные ложные слоты или дубли. Поэтому CRPS-D backend оставлен как baseline/fallback, но не выглядит лучшим путем дальше.
+
+## YOLO-OBB detector на ParkRecon3D
+
+Новый эксперимент: обучать прямой oriented-box detector, где каждый слот - четырехугольник.
+
+Конвертация датасета:
+
+```bash
+python scripts/convert_parkrecon3d_yolo_obb.py \
+  --source-dir outputs/parkrecon3d_bev_crpsd_format/raw \
+  --output-dir outputs/parkrecon3d_yolo_obb
+```
+
+Kaggle zip:
 
 ```text
-outputs/kaggle_parkrecon3d_bev_dataset/parkrecon3d_bev_crpsd_format.zip
-outputs/kaggle_slot_detector_training_code/slot_detector_training_code.zip
-outputs/kaggle_slot_detector_weights/crpsd_slot_detector_pretrained_1_2.zip
+outputs/kaggle_parkrecon3d_yolo_obb/parkrecon3d_yolo_obb.zip
 ```
 
-### ParkRecon3D Camera0/Camera1/Camera2
+Инструкция:
 
-В ParkRecon3D также есть обычные камеры:
+```text
+docs/kaggle_yolo_obb.md
+```
+
+Локальная проверка YOLO-OBB:
+
+```bash
+python scripts/evaluate_parkrecon3d_bev.py \
+  --image-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/img \
+  --label-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/slot_label \
+  --slot-backend yolo_obb \
+  --slot-model-path models/slot_detector/best_yolo_parkrecon.pt \
+  --slot-conf 0.55 \
+  --detector-input-size 1024 \
+  --device cpu \
+  --skip-occupancy \
+  --preview-limit 100 \
+  --output-dir outputs/parkrecon3d_yolo_obb_eval_conf055_full_test
+```
+
+Текущий checkpoint после 15 эпох на Kaggle:
+
+```text
+slot_conf: 0.55
+images: 1001
+gt_slots: 4786
+pred_slots: 4952
+matched_slots: 4574
+false_negative_slots: 212
+false_positive_slots: 378
+
+recall:    95.57%
+precision: 92.37%
+F1:        93.94%
+```
+
+Sweep по `slot_conf` показал:
+
+```text
+0.25: recall 98.47%, precision 88.89%, F1 93.44%
+0.55: recall 95.84%, precision 93.57%, F1 94.69%  # лучший F1 в single-pass sweep
+0.60: recall 95.13%, precision 94.15%, F1 94.64%  # чуть чище, почти тот же F1
+0.70: recall 93.36%, precision 95.47%, F1 94.40%
+```
+
+Практический вывод: `slot_conf=0.55` - текущий лучший баланс. Если нужно меньше визуального мусора, можно пробовать `0.60`.
+
+## Full pipeline на ParkRecon3D BEV
+
+Для визуальной проверки detector + occupancy classifier:
+
+```bash
+python scripts/evaluate_parkrecon3d_bev.py \
+  --image-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/img \
+  --label-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/slot_label \
+  --slot-backend yolo_obb \
+  --slot-model-path models/slot_detector/best_yolo_parkrecon.pt \
+  --slot-conf 0.55 \
+  --detector-input-size 1024 \
+  --occupancy-model-path models/occupancy/efficientnet_b0_crpsd.pt \
+  --device cpu \
+  --preview-limit 100 \
+  --output-dir outputs/parkrecon3d_yolo_obb_occupancy_qa_conf055
+```
+
+Выход:
+
+```text
+summary.json
+predictions.json
+preview/
+crops/free/
+crops/occupied/
+crops/low_confidence/
+contact_sheet.jpg
+```
+
+Так как occupancy GT в ParkRecon3D нет, это именно visual QA, а не честная accuracy.
+
+## ParkRecon3D Camera0/Camera1/Camera2
+
+В ParkRecon3D есть обычные камеры:
 
 ```text
 <dataset_part>/Camera0/Data/Image
@@ -394,9 +442,7 @@ outputs/kaggle_slot_detector_weights/crpsd_slot_detector_pretrained_1_2.zip
 <dataset_part>/Camera2/Data/Image
 ```
 
-В этих папках нет `label/*.json` с разметкой парковочных мест, поэтому они подготовлены как image-only splits. Их можно использовать для визуальной проверки домена, inference без метрик, future pseudo-labeling или ручной разметки. Для supervised fine-tune текущего slot detector использовать их напрямую нельзя.
-
-Подготовка:
+В этих папках нет `label/*.json` с разметкой парковочных мест. Они подготовлены как image-only splits для визуальной проверки, pseudo-labeling или будущей ручной разметки:
 
 ```bash
 python scripts/prepare_parkrecon3d_camera_images.py \
@@ -412,82 +458,48 @@ python scripts/prepare_parkrecon3d_camera_images.py \
   --gap-size 30
 ```
 
-Выход:
+`IMU` и `Wheel` содержат CSV с сенсорикой автомобиля: ускорения, угловые скорости, колесная одометрия, скорость/поворот. Для текущего image-only detector они не используются, но могут пригодиться для ego-motion, локализации, стабилизации sequence и 3D-реконструкции.
 
-```text
-outputs/parkrecon3d_camera_images/
-  Camera0/train/img/
-  Camera0/test/img/
-  Camera1/train/img/
-  Camera1/test/img/
-  Camera2/train/img/
-  Camera2/test/img/
-  summary.json
-```
-
-Текущий split:
-
-```text
-Camera0: train 3974, test 1001
-Camera1: train 3974, test 1001
-Camera2: train 3974, test 1001
-```
-
-Архив для Kaggle:
-
-```text
-outputs/kaggle_parkrecon3d_camera_images/parkrecon3d_camera_images.zip
-```
-
-Папки `IMU` и `Wheel` содержат CSV с синхронизированными сенсорными данными автомобиля. `IMU` обычно нужен для ускорений/угловых скоростей, `Wheel` - для колесной одометрии, скорости/поворота и оценки движения машины. Они полезны для задач локализации, ego-motion, 3D-реконструкции и синхронизации кадров, но текущий image-only slot detector их не использует.
-
-Эксперимент с проекцией BEV-разметки на `Camera0/Camera1/Camera2` описан здесь:
+Эксперимент с проекцией BEV labels на камеры описан здесь:
 
 ```text
 docs/parkrecon3d_camera_projection.md
 ```
 
-Короткий вывод: проекция возможна через calibration files `param.yaml` и `stitch.json`, но перед генерацией train labels для камер нужна фильтрация видимости и ручная проверка, иначе часть лейблов попадет на капот или в невидимые области.
+Короткий вывод: проекция возможна, но без сильной фильтрации видимости разметка получается грязной.
 
 ## Что сделано
 
 1. Собран базовый pipeline для видео.
-2. Подключен YOLO vehicle detector.
-3. Проверено, что vehicle detector плохо подходит для surround-view кадров.
-4. Подключен pretrained CRPS-D slot detector.
-5. Подготовлены CRPS-D occupancy crops для обучения классификатора.
-6. Обучен EfficientNet-B0 occupancy classifier.
-7. Встроен classifier backend в occupancy estimation.
-8. Проверен classifier на полных CRPS-D кадрах с GT-слотами.
-9. Проверена полная связка на CRPS-D.
-10. Проверен перенос на ParkRecon3D BEV.
-11. Сделан конвертер ParkRecon3D BEV в CRPS-D-like формат.
-12. Исправлен split ParkRecon3D BEV: random split заменен на хронологический split с gap, чтобы убрать leakage между train и test.
-13. Собран Kaggle zip для ParkRecon3D BEV fine-tune.
-14. Подготовлены image-only splits для ParkRecon3D Camera0/Camera1/Camera2.
-15. Сделан первичный эксперимент с проекцией BEV labels на fisheye камеры.
+2. Подключен YOLO vehicle detector; для surround-view он оказался не основным решением.
+3. Подключен pretrained CRPS-D slot detector.
+4. Подготовлены CRPS-D occupancy crops.
+5. Обучен и встроен EfficientNet-B0 occupancy classifier.
+6. Проверена occupancy accuracy на CRPS-D GT slots.
+7. Проверена полная связка на CRPS-D.
+8. Подготовлен ParkRecon3D BEV split с chronological gap и проверкой leakage.
+9. Дообучен CRPS-D-like slot detector на ParkRecon3D BEV.
+10. Проведены эксперименты с prepared conversion, relaxed pairing, row-consensus postprocess и temporal smoothing.
+11. Сделан вывод, что CRPS-D pairing близок к потолку для ParkRecon3D.
+12. Подготовлен YOLO-OBB датасет.
+13. Обучен YOLO-OBB checkpoint на 15 эпохах.
+14. YOLO-OBB проверен на полном ParkRecon3D test split и стал основным кандидатом.
 
-## Что планируется дальше
+## Что делать дальше
 
-Ближайший важный этап:
+Ближайшие шаги:
 
-1. Дообучить slot detector на `outputs/parkrecon3d_bev_crpsd_format/prepared/train`.
-2. Проверить новые веса на `prepared/test` или raw test через `evaluate_parkrecon3d_bev.py`.
-3. Сравнить с текущим baseline:
-   - baseline recall на ParkRecon3D BEV: `17.8%`;
-   - цель после fine-tune: существенно поднять recall без сильной просадки precision.
-
-После этого:
-
-4. Подключить новые slot detector weights в `configs/default.yaml`.
-5. Перепроверить полную связку detector + occupancy classifier.
-6. Если будет датасет с occupancy labels для BEV, дообучить occupancy classifier уже под ParkRecon3D-like домен.
-7. Сделать удобный inference script для папки кадров и для видео.
-8. Добавить нормальный train/fine-tune script для CRPS-D detector, чтобы не править `external/CRPS-D/train.py` руками.
+1. Дождаться полного YOLO-OBB обучения на 80 эпохах.
+2. Положить новый `best.pt` в `models/slot_detector/`.
+3. Повторить `slot_conf` sweep, потому что оптимальный порог может сместиться.
+4. Переключить `configs/default.yaml` на YOLO-OBB как основной backend, если новый checkpoint подтверждает качество.
+5. Прогнать full pipeline `YOLO-OBB -> occupancy classifier` на полном ParkRecon3D test sequence.
+6. Собрать видео/sequence preview.
+7. Если occupancy визуально ошибается на ParkRecon3D, собрать 300-1000 crops и вручную доразметить `free/occupied` для дообучения classifier под новый домен.
 
 ## Важные замечания
 
-- CRPS-D detector обучался на `512x512`, поэтому для ParkRecon3D BEV обязательно нужен resize или отдельное обучение под исходное разрешение.
-- ParkRecon3D BEV является раскадровкой видео, поэтому random split дает leakage. Использовать только chronological split с gap.
-- В текущем ParkRecon3D BEV labels нет occupancy GT, значит нельзя честно оценить free/occupied accuracy на этом датасете.
+- ParkRecon3D BEV является раскадровкой видео, поэтому использовать только chronological split с gap.
+- В ParkRecon3D BEV нет occupancy GT, значит `free/occupied` на этом датасете проверяется визуально.
+- CRPS-D backend не удален, но новый основной путь - YOLO-OBB.
 - Большие веса и датасеты не лежат в git, их нужно передавать отдельно или загружать через Kaggle datasets.
