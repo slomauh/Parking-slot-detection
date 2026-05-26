@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-path", default="models/occupancy/efficientnet_b0_crpsd.pt")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--threshold", type=float, default=0.50)
     parser.add_argument("--crop-size", type=int, default=224)
     parser.add_argument("--output-dir", default="outputs/crpsd_occupancy_eval")

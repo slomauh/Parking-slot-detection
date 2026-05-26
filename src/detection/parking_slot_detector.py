@@ -18,6 +18,7 @@ class ParkingSlotDetector:
     Backends:
     - mock: deterministic synthetic slots for smoke tests.
     - crpsd: pretrained SS-PSD/CRPS-D PyTorch checkpoint from zzh362/CRPS-D.
+    - yolo_obb: Ultralytics oriented bounding-box detector for direct slot polygons.
     """
 
     def __init__(self, config: dict) -> None:
@@ -26,13 +27,18 @@ class ParkingSlotDetector:
         self.model_path = str(config.get("model_path", "models/parking_slot/pretrained.pt"))
         self.device_name = str(config.get("device", "cpu"))
         self.conf_threshold = float(config.get("conf_threshold", 0.30))
+        self.imgsz = int(config.get("imgsz", 512))
         self.depth_factor = int(config.get("depth_factor", 32))
         self.external_repo_path = Path(config.get("external_repo_path", "external/CRPS-D")).resolve()
         self.slot_pairing_strategy = str(config.get("slot_pairing_strategy", "crpsd")).lower()
+        self.slot_postprocess_mode = str(config.get("slot_postprocess_mode", "standard")).lower()
         self.pairing_distance_scale = float(config.get("pairing_distance_scale", 1.0))
         self.max_point_degree = int(config.get("max_point_degree", 0))
         self.min_slot_score = float(config.get("min_slot_score", 0.0))
         self.slot_nms_iou = float(config.get("slot_nms_iou", 0.0))
+        self.slot_center_nms_distance = float(config.get("slot_center_nms_distance", 0.0))
+        self.slot_angle_nms_threshold = float(config.get("slot_angle_nms_threshold", 20.0))
+        self.slot_centerline_overlap_threshold = float(config.get("slot_centerline_overlap_threshold", 0.0))
         self.geometry_filter_enabled = bool(config.get("geometry_filter_enabled", False))
         self.min_slot_area_ratio = float(config.get("min_slot_area_ratio", 0.0))
         self.max_slot_area_ratio = float(config.get("max_slot_area_ratio", 1.0))
@@ -42,17 +48,23 @@ class ParkingSlotDetector:
         self.orientation_neighbor_radius = float(config.get("orientation_neighbor_radius", 130.0))
         self.orientation_min_neighbors = int(config.get("orientation_min_neighbors", 2))
         self.orientation_angle_threshold = float(config.get("orientation_angle_threshold", 60.0))
+        self.orientation_score_margin = float(config.get("orientation_score_margin", 1.05))
         self.model = None
         self._crpsd = None
+        self.last_suppressed_slots: list[dict] = []
 
-        if self.backend not in {"mock", "crpsd"}:
+        if self.backend not in {"mock", "crpsd", "yolo_obb"}:
             raise ValueError(f"Unsupported parking slot detector backend: {self.backend}")
-        if self.slot_pairing_strategy not in {"crpsd", "relaxed"}:
+        if self.backend == "crpsd" and self.slot_pairing_strategy not in {"crpsd", "relaxed"}:
             raise ValueError(f"Unsupported slot pairing strategy: {self.slot_pairing_strategy}")
+        if self.backend == "crpsd" and self.slot_postprocess_mode not in {"standard", "row_consensus"}:
+            raise ValueError(f"Unsupported slot postprocess mode: {self.slot_postprocess_mode}")
 
     def detect(self, frame: np.ndarray) -> list[ParkingSlot]:
         if self.backend == "crpsd":
             return self._detect_crpsd(frame)
+        if self.backend == "yolo_obb":
+            return self._detect_yolo_obb(frame)
         return self._detect_mock(frame)
 
     def _detect_mock(self, frame: np.ndarray) -> list[ParkingSlot]:
@@ -89,6 +101,50 @@ class ParkingSlotDetector:
 
         return self._convert_pred_points_to_slots(frame, pred_points)
 
+    def _detect_yolo_obb(self, frame: np.ndarray) -> list[ParkingSlot]:
+        self._load_yolo_obb_model()
+        assert self.model is not None
+
+        device_name = self.device_name
+        if device_name != "cpu" and not torch.cuda.is_available():
+            device_name = "cpu"
+        results = self.model.predict(
+            source=frame,
+            imgsz=self.imgsz,
+            conf=self.conf_threshold,
+            device=device_name,
+            verbose=False,
+        )
+        if not results:
+            self.last_suppressed_slots = []
+            return []
+        result = results[0]
+        if getattr(result, "obb", None) is None or result.obb is None:
+            self.last_suppressed_slots = []
+            return []
+
+        polygons = result.obb.xyxyxyxy.detach().cpu().numpy()
+        confidences = result.obb.conf.detach().cpu().numpy() if result.obb.conf is not None else np.ones(len(polygons))
+        slots = []
+        for idx, (polygon, confidence) in enumerate(zip(polygons, confidences), start=1):
+            points = [(float(x), float(y)) for x, y in polygon]
+            slots.append(ParkingSlot(slot_id=idx, points=points, confidence=float(confidence), type="yolo_obb"))
+        return self._postprocess_slots(frame, slots)
+
+    def _load_yolo_obb_model(self) -> None:
+        if self.model is not None:
+            return
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(f"YOLO-OBB detector weights not found: {self.model_path}")
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise ImportError(
+                "parking_slot_detector.backend is 'yolo_obb', but ultralytics is not installed. "
+                "Install dependencies from requirements.txt or switch backend to 'crpsd'."
+            ) from exc
+        self.model = YOLO(self.model_path)
+
     def _convert_pred_points_to_slots(self, frame: np.ndarray, pred_points: list) -> list[ParkingSlot]:
         if not pred_points:
             return []
@@ -100,7 +156,7 @@ class ParkingSlotDetector:
         else:
             assert self._crpsd is not None
             raw_slots = self._crpsd["inference_slots"](marking_points)
-        raw_slots = self._postprocess_raw_slots(marking_points, raw_slots)
+        raw_slots = self._postprocess_raw_slots(marking_points, raw_slots, point_confidences)
         slots = self._convert_crpsd_slots(frame, marking_points, raw_slots, point_confidences)
         return self._postprocess_slots(frame, slots)
 
@@ -192,11 +248,26 @@ class ParkingSlotDetector:
                     slots.append((j, i, result[1]))
         return slots
 
-    def _postprocess_raw_slots(self, marking_points: list, raw_slots: list) -> list:
+    def _postprocess_raw_slots(
+        self,
+        marking_points: list,
+        raw_slots: list,
+        point_confidences: list[float] | None = None,
+    ) -> list:
         if self.max_point_degree <= 0 or len(raw_slots) < 3:
             return raw_slots
 
-        ordered_slots = sorted(raw_slots, key=lambda raw_slot: self._raw_slot_bridge_length(marking_points, raw_slot))
+        if self.slot_postprocess_mode == "row_consensus":
+            ordered_slots = sorted(
+                raw_slots,
+                key=lambda raw_slot: (
+                    self._raw_slot_score(point_confidences, raw_slot),
+                    -self._raw_slot_bridge_length(marking_points, raw_slot),
+                ),
+                reverse=True,
+            )
+        else:
+            ordered_slots = sorted(raw_slots, key=lambda raw_slot: self._raw_slot_bridge_length(marking_points, raw_slot))
         point_degrees: dict[int, int] = {}
         kept_slots = []
         for raw_slot in ordered_slots:
@@ -286,12 +357,15 @@ class ParkingSlotDetector:
         return float(math.sqrt(max(0.0, point_confidences[point_a_idx]) * max(0.0, point_confidences[point_b_idx])))
 
     def _postprocess_slots(self, frame: np.ndarray, slots: list[ParkingSlot]) -> list[ParkingSlot]:
+        self.last_suppressed_slots = []
         if not slots:
             return []
 
         kept = [slot for slot in slots if slot.confidence >= self.min_slot_score]
         if self.geometry_filter_enabled:
             kept = [slot for slot in kept if self._slot_geometry_is_valid(frame, slot)]
+        if self.slot_postprocess_mode == "row_consensus":
+            kept = self._slot_center_angle_nms(kept)
         if self.slot_nms_iou > 0:
             kept = self._slot_polygon_nms(kept, self.slot_nms_iou)
         if self.orientation_filter_enabled:
@@ -345,9 +419,60 @@ class ParkingSlotDetector:
             polygon = self._make_polygon(slot.points)
             if polygon is None:
                 continue
-            if any(self._polygon_iou(polygon, kept_polygon) >= iou_threshold for kept_polygon in kept_polygons):
+            suppressing_iou = max((self._polygon_iou(polygon, kept_polygon) for kept_polygon in kept_polygons), default=0.0)
+            if suppressing_iou >= iou_threshold:
+                self._record_suppressed_slot(slot, "duplicate_polygon_iou", suppressing_iou)
                 continue
             kept.append(slot)
+            kept_polygons.append(polygon)
+        return kept
+
+    def _slot_center_angle_nms(self, slots: list[ParkingSlot]) -> list[ParkingSlot]:
+        if not slots or self.slot_center_nms_distance <= 0:
+            return slots
+
+        ordered_slots = sorted(slots, key=lambda slot: slot.confidence, reverse=True)
+        kept: list[ParkingSlot] = []
+        kept_centers: list[np.ndarray] = []
+        kept_angles: list[float] = []
+        kept_slots: list[ParkingSlot] = []
+        kept_polygons = []
+        for slot in ordered_slots:
+            center = self._slot_center(slot)
+            angle = self._slot_bridge_angle(slot)
+            polygon = self._make_polygon(slot.points)
+            if polygon is None:
+                self._record_suppressed_slot(slot, "invalid_polygon", 0.0)
+                continue
+
+            duplicate_score = 0.0
+            is_duplicate = False
+            for kept_center, kept_angle, kept_slot, kept_polygon in zip(
+                kept_centers,
+                kept_angles,
+                kept_slots,
+                kept_polygons,
+            ):
+                center_distance = float(np.linalg.norm(center - kept_center))
+                angle_diff = self._axial_angle_diff_degrees(angle, kept_angle)
+                iou = self._polygon_iou(polygon, kept_polygon)
+                centerline_overlap = self._centerline_overlap_ratio(slot.points, kept_slot.points)
+                duplicate_score = max(duplicate_score, iou, centerline_overlap)
+                if center_distance <= self.slot_center_nms_distance and angle_diff <= self.slot_angle_nms_threshold:
+                    is_duplicate = True
+                    break
+                if self.slot_centerline_overlap_threshold > 0 and centerline_overlap >= self.slot_centerline_overlap_threshold:
+                    if angle_diff <= self.slot_angle_nms_threshold:
+                        is_duplicate = True
+                        break
+
+            if is_duplicate:
+                self._record_suppressed_slot(slot, "duplicate_center_angle", duplicate_score)
+                continue
+            kept.append(slot)
+            kept_centers.append(center)
+            kept_angles.append(angle)
+            kept_slots.append(slot)
             kept_polygons.append(polygon)
         return kept
 
@@ -371,10 +496,53 @@ class ParkingSlotDetector:
             angle_diffs = [self._axial_angle_diff_degrees(bridge_angles[idx], bridge_angles[other_idx]) for other_idx in neighbors]
             median_diff = float(np.median(angle_diffs))
             neighbor_confidence = float(np.median([slots[other_idx].confidence for other_idx in neighbors]))
-            if median_diff >= self.orientation_angle_threshold and slot.confidence <= neighbor_confidence:
+            intersects_neighbors = self._slot_intersects_any(slot, [slots[other_idx] for other_idx in neighbors])
+            if (
+                median_diff >= self.orientation_angle_threshold
+                and slot.confidence <= neighbor_confidence * self.orientation_score_margin
+                and (self.slot_postprocess_mode != "row_consensus" or intersects_neighbors)
+            ):
                 suppressed.add(idx)
+                self._record_suppressed_slot(slot, "transverse_orientation_outlier", median_diff)
 
         return [slot for idx, slot in enumerate(slots) if idx not in suppressed]
+
+    def _slot_intersects_any(self, slot: ParkingSlot, other_slots: list[ParkingSlot]) -> bool:
+        polygon = self._make_polygon(slot.points)
+        if polygon is None:
+            return False
+        for other_slot in other_slots:
+            other_polygon = self._make_polygon(other_slot.points)
+            if other_polygon is None:
+                continue
+            if polygon.intersects(other_polygon) or self._polygon_iou(polygon, other_polygon) > 0:
+                return True
+        return False
+
+    def _record_suppressed_slot(self, slot: ParkingSlot, reason: str, score: float) -> None:
+        self.last_suppressed_slots.append(
+            {
+                "reason": reason,
+                "score": float(score),
+                "confidence": float(slot.confidence),
+                "points": [[float(x), float(y)] for x, y in slot.points],
+            }
+        )
+
+    def _centerline_overlap_ratio(self, points_a, points_b) -> float:
+        center_a = np.mean(np.array(points_a, dtype=np.float32), axis=0)
+        center_b = np.mean(np.array(points_b, dtype=np.float32), axis=0)
+        length_a = self._slot_bridge_pixel_length(points_a)
+        length_b = self._slot_bridge_pixel_length(points_b)
+        if length_a <= 1e-6 or length_b <= 1e-6:
+            return 0.0
+        center_distance = float(np.linalg.norm(center_a - center_b))
+        return max(0.0, 1.0 - center_distance / max(length_a, length_b))
+
+    @staticmethod
+    def _slot_bridge_pixel_length(points) -> float:
+        array = np.array(points, dtype=np.float32)
+        return float(np.linalg.norm(array[1] - array[0]))
 
     @staticmethod
     def _slot_center(slot: ParkingSlot) -> np.ndarray:
