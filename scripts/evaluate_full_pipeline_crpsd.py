@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-external-repo-path", default="external/CRPS-D")
     parser.add_argument("--slot-conf", type=float, default=0.40)
     parser.add_argument("--occupancy-model-path", default="models/occupancy/efficientnet_b0_crpsd.pt")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--occupancy-threshold", type=float, default=0.50)
     parser.add_argument("--match-iou", type=float, default=0.20)
     parser.add_argument("--output-dir", default="outputs/crpsd_full_pipeline_eval")

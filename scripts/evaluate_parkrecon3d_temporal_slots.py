@@ -203,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-dir", default="outputs/parkrecon3d_bev_crpsd_format/raw/test/slot_label")
     parser.add_argument("--slot-model-path", default="models/slot_detector/parkrecon3d_slot_detector_finetuned.pth")
     parser.add_argument("--slot-external-repo-path", default="external/CRPS-D")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--detector-input-size", type=int, default=512)
     parser.add_argument("--slot-conf", type=float, default=0.30)
     parser.add_argument("--slot-min-score", type=float, default=0.35)

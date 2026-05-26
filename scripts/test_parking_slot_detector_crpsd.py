@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-path", default="/home/slomauh/pretrain_model/pretrain_model/1:2.pth")
     parser.add_argument("--external-repo-path", default="external/CRPS-D")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--conf", type=float, default=0.40)
     parser.add_argument("--save-preview", type=int, default=50)
     parser.add_argument("--output-dir", default="outputs/crpsd_slot_test")

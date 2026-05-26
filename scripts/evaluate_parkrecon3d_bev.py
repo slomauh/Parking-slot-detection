@@ -28,14 +28,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-dir", help="Optional direct directory with ParkRecon3D slot labels")
     parser.add_argument("--limit", type=int, help="Optional number of images to evaluate")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--slot-backend", choices=["crpsd", "yolo_obb"], default="crpsd")
     parser.add_argument("--slot-model-path", default="/home/slomauh/pretrain_model/pretrain_model/1:2.pth")
     parser.add_argument("--slot-external-repo-path", default="external/CRPS-D")
     parser.add_argument("--slot-conf", type=float, default=0.40)
     parser.add_argument("--slot-pairing-strategy", choices=["crpsd", "relaxed"], default="crpsd")
+    parser.add_argument("--slot-postprocess-mode", choices=["standard", "row_consensus"], default="standard")
     parser.add_argument("--slot-pairing-distance-scale", type=float, default=1.0)
     parser.add_argument("--slot-max-point-degree", type=int, default=0)
     parser.add_argument("--slot-min-score", type=float, default=0.0)
     parser.add_argument("--slot-nms-iou", type=float, default=0.0)
+    parser.add_argument("--slot-center-nms-distance", type=float, default=0.0)
+    parser.add_argument("--slot-angle-nms-threshold", type=float, default=20.0)
+    parser.add_argument("--slot-centerline-overlap-threshold", type=float, default=0.0)
     parser.add_argument("--slot-geometry-filter", action="store_true")
     parser.add_argument("--slot-min-area-ratio", type=float, default=0.0)
     parser.add_argument("--slot-max-area-ratio", type=float, default=1.0)
@@ -45,9 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-orientation-neighbor-radius", type=float, default=130.0)
     parser.add_argument("--slot-orientation-min-neighbors", type=int, default=2)
     parser.add_argument("--slot-orientation-angle-threshold", type=float, default=60.0)
+    parser.add_argument("--slot-orientation-score-margin", type=float, default=1.05)
     parser.add_argument("--detector-input-size", type=int, help="Resize BEV frame to NxN before slot detection")
     parser.add_argument("--occupancy-model-path", default="models/occupancy/efficientnet_b0_crpsd.pt")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--skip-occupancy", action="store_true")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--occupancy-threshold", type=float, default=0.50)
     parser.add_argument("--low-confidence-threshold", type=float, default=0.70)
     parser.add_argument("--match-iou", type=float, default=0.10)
@@ -74,7 +81,14 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     preview_dir = output_dir / "preview"
+    suppressed_dirs = {
+        "duplicates": output_dir / "suppressed" / "duplicates",
+        "transverse": output_dir / "suppressed" / "transverse",
+        "other": output_dir / "suppressed" / "other",
+    }
     preview_dir.mkdir(parents=True, exist_ok=True)
+    for suppressed_dir in suppressed_dirs.values():
+        suppressed_dir.mkdir(parents=True, exist_ok=True)
     crop_dirs = {
         "free": output_dir / "crops" / "free",
         "occupied": output_dir / "crops" / "occupied",
@@ -85,17 +99,22 @@ def main() -> None:
 
     slot_detector = ParkingSlotDetector(
         {
-            "backend": "crpsd",
+            "backend": args.slot_backend,
             "model_path": args.slot_model_path,
             "external_repo_path": args.slot_external_repo_path,
             "device": args.device,
             "conf_threshold": args.slot_conf,
             "depth_factor": 32,
+            "imgsz": args.detector_input_size or 512,
             "slot_pairing_strategy": args.slot_pairing_strategy,
+            "slot_postprocess_mode": args.slot_postprocess_mode,
             "pairing_distance_scale": args.slot_pairing_distance_scale,
             "max_point_degree": args.slot_max_point_degree,
             "min_slot_score": args.slot_min_score,
             "slot_nms_iou": args.slot_nms_iou,
+            "slot_center_nms_distance": args.slot_center_nms_distance,
+            "slot_angle_nms_threshold": args.slot_angle_nms_threshold,
+            "slot_centerline_overlap_threshold": args.slot_centerline_overlap_threshold,
             "geometry_filter_enabled": args.slot_geometry_filter,
             "min_slot_area_ratio": args.slot_min_area_ratio,
             "max_slot_area_ratio": args.slot_max_area_ratio,
@@ -105,17 +124,20 @@ def main() -> None:
             "orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
             "orientation_min_neighbors": args.slot_orientation_min_neighbors,
             "orientation_angle_threshold": args.slot_orientation_angle_threshold,
+            "orientation_score_margin": args.slot_orientation_score_margin,
         }
     )
-    classifier = EfficientNetOccupancyClassifier(
-        {
-            "model_path": args.occupancy_model_path,
-            "device": args.device,
-            "crop_size": 224,
-            "occupied_threshold": args.occupancy_threshold,
-            "use_pretrained_backbone": False,
-        }
-    )
+    classifier = None
+    if not args.skip_occupancy:
+        classifier = EfficientNetOccupancyClassifier(
+            {
+                "model_path": args.occupancy_model_path,
+                "device": args.device,
+                "crop_size": 224,
+                "occupied_threshold": args.occupancy_threshold,
+                "use_pretrained_backbone": False,
+            }
+        )
 
     records = []
     counts: Counter[str] = Counter()
@@ -135,7 +157,8 @@ def main() -> None:
 
         gt_slots = load_parkrecon3d_slots(label_path)
         pred_slots = detect_slots(slot_detector, frame, args.detector_input_size)
-        occupancy_predictions = classifier.predict(frame, pred_slots)
+        suppressed_slots = getattr(slot_detector, "last_suppressed_slots", [])
+        occupancy_predictions = classifier.predict(frame, pred_slots) if classifier is not None else {}
         matches = match_slots(gt_slots, pred_slots, args.match_iou)
 
         matched_gt_ids = {match["gt_slot"].slot_id for match in matches}
@@ -175,26 +198,28 @@ def main() -> None:
         for pred_slot in pred_slots:
             pred_status, confidence = occupancy_predictions.get(pred_slot.slot_id, ("unknown", 0.0))
             bucket = occupancy_bucket(pred_status, confidence, args.low_confidence_threshold)
-            confidence_bins[confidence_bin(confidence)] += 1
-            crop_bucket_counts[bucket] += 1
-            crop_path = save_qa_crop(
-                frame,
-                pred_slot,
-                image_path.stem,
-                pred_status,
-                confidence,
-                bucket,
-                crop_dirs[bucket],
-                args.qa_crop_size,
-                pred_slot.slot_id in matched_pred_ids,
-            )
+            crop_path = None
+            if classifier is not None:
+                confidence_bins[confidence_bin(confidence)] += 1
+                crop_bucket_counts[bucket] += 1
+                crop_path = save_qa_crop(
+                    frame,
+                    pred_slot,
+                    image_path.stem,
+                    pred_status,
+                    confidence,
+                    bucket,
+                    crop_dirs[bucket],
+                    args.qa_crop_size,
+                    pred_slot.slot_id in matched_pred_ids,
+                )
             predicted_slot_records.append(
                 {
                     "pred_slot_id": pred_slot.slot_id,
                     "pred_status": pred_status,
                     "pred_status_confidence": confidence,
                     "qa_bucket": bucket,
-                    "crop_path": str(crop_path),
+                    "crop_path": str(crop_path) if crop_path is not None else None,
                     "matched": pred_slot.slot_id in matched_pred_ids,
                     "points": [[float(x), float(y)] for x, y in pred_slot.points],
                 }
@@ -205,26 +230,38 @@ def main() -> None:
                 "image": str(image_path),
                 "matches": image_matches,
                 "predicted_slots": predicted_slot_records,
+                "suppressed_slots": suppressed_slots,
                 "false_negative_slot_ids": [slot.slot_id for slot in false_negative_slots],
                 "false_positive_slot_ids": [slot.slot_id for slot in false_positive_slots],
             }
         )
 
+        rendered_preview = None
         if preview_written < args.preview_limit:
-            cv2.imwrite(str(preview_dir / image_path.name), draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions))
+            rendered_preview = draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions, suppressed_slots)
+            cv2.imwrite(str(preview_dir / image_path.name), rendered_preview)
             preview_written += 1
+        if suppressed_slots:
+            if rendered_preview is None:
+                rendered_preview = draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions, suppressed_slots)
+            write_suppressed_preview(rendered_preview, image_path.name, suppressed_slots, suppressed_dirs)
 
     metrics = build_metrics(counts)
     summary = {
         "dataset_root": str(dataset_root),
         "image_dir": str(image_dir),
+        "slot_backend": args.slot_backend,
         "slot_model_path": args.slot_model_path,
         "slot_conf": args.slot_conf,
         "slot_pairing_strategy": args.slot_pairing_strategy,
+        "slot_postprocess_mode": args.slot_postprocess_mode,
         "slot_pairing_distance_scale": args.slot_pairing_distance_scale,
         "slot_max_point_degree": args.slot_max_point_degree,
         "slot_min_score": args.slot_min_score,
         "slot_nms_iou": args.slot_nms_iou,
+        "slot_center_nms_distance": args.slot_center_nms_distance,
+        "slot_angle_nms_threshold": args.slot_angle_nms_threshold,
+        "slot_centerline_overlap_threshold": args.slot_centerline_overlap_threshold,
         "slot_geometry_filter": args.slot_geometry_filter,
         "slot_min_area_ratio": args.slot_min_area_ratio,
         "slot_max_area_ratio": args.slot_max_area_ratio,
@@ -234,7 +271,9 @@ def main() -> None:
         "slot_orientation_neighbor_radius": args.slot_orientation_neighbor_radius,
         "slot_orientation_min_neighbors": args.slot_orientation_min_neighbors,
         "slot_orientation_angle_threshold": args.slot_orientation_angle_threshold,
+        "slot_orientation_score_margin": args.slot_orientation_score_margin,
         "occupancy_model_path": args.occupancy_model_path,
+        "skip_occupancy": args.skip_occupancy,
         "occupancy_threshold": args.occupancy_threshold,
         "low_confidence_threshold": args.low_confidence_threshold,
         "match_iou": args.match_iou,
@@ -245,6 +284,8 @@ def main() -> None:
         "metrics": metrics,
         "preview_dir": str(preview_dir),
         "crop_dirs": {name: str(path) for name, path in crop_dirs.items()},
+        "suppressed_counts": dict(count_suppressed_reasons(records)),
+        "suppressed_dirs": {name: str(path) for name, path in suppressed_dirs.items()},
         "contact_sheets": {
             "preview": str(output_dir / "contact_sheet.jpg"),
             "free": str(output_dir / "crops_contact_sheet_free.jpg"),
@@ -327,6 +368,12 @@ def detect_slots(slot_detector: ParkingSlotDetector, frame: np.ndarray, input_si
     detected_slots = slot_detector.detect(detector_frame)
     scale_x = original_width / input_size
     scale_y = original_height / input_size
+    if getattr(slot_detector, "last_suppressed_slots", None):
+        slot_detector.last_suppressed_slots = scale_suppressed_slots(
+            slot_detector.last_suppressed_slots,
+            scale_x,
+            scale_y,
+        )
 
     scaled_slots = []
     for slot in detected_slots:
@@ -340,6 +387,18 @@ def detect_slots(slot_detector: ParkingSlotDetector, frame: np.ndarray, input_si
             )
         )
     return scaled_slots
+
+
+def scale_suppressed_slots(suppressed_slots: list[dict], scale_x: float, scale_y: float) -> list[dict]:
+    scaled = []
+    for suppressed_slot in suppressed_slots:
+        record = dict(suppressed_slot)
+        record["points"] = [
+            [float(x) * scale_x, float(y) * scale_y]
+            for x, y in suppressed_slot.get("points", [])
+        ]
+        scaled.append(record)
+    return scaled
 
 
 def slot_type_name(value: float) -> str:
@@ -394,9 +453,13 @@ def build_metrics(counts: Counter[str]) -> dict[str, float]:
     matched = counts["matched_slots"]
     gt_slots = counts["gt_slots"]
     pred_slots = counts["pred_slots"]
+    recall = matched / max(1, gt_slots)
+    precision = matched / max(1, pred_slots)
+    f1 = 2 * precision * recall / max(1e-12, precision + recall)
     return {
-        "slot_recall": matched / max(1, gt_slots),
-        "slot_precision": matched / max(1, pred_slots),
+        "slot_recall": recall,
+        "slot_precision": precision,
+        "slot_f1": f1,
     }
 
 
@@ -473,7 +536,25 @@ def make_contact_sheet(input_dir: Path, output_path: Path, limit: int, tile_size
     cv2.imwrite(str(output_path), cv2.vconcat(rows), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
 
-def draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions):
+def write_suppressed_preview(image, filename: str, suppressed_slots: list[dict], output_dirs: dict[str, Path]) -> None:
+    reasons = {str(slot.get("reason", "")) for slot in suppressed_slots}
+    if any("transverse" in reason for reason in reasons):
+        cv2.imwrite(str(output_dirs["transverse"] / filename), image)
+    if any("duplicate" in reason for reason in reasons):
+        cv2.imwrite(str(output_dirs["duplicates"] / filename), image)
+    if not any("transverse" in reason or "duplicate" in reason for reason in reasons):
+        cv2.imwrite(str(output_dirs["other"] / filename), image)
+
+
+def count_suppressed_reasons(records: list[dict]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        for suppressed_slot in record.get("suppressed_slots", []):
+            counts[str(suppressed_slot.get("reason", "unknown"))] += 1
+    return counts
+
+
+def draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions, suppressed_slots: list[dict] | None = None):
     output = frame.copy()
     matched_gt_ids = {match["gt_slot"].slot_id for match in matches}
     matched_pred_ids = {match["pred_slot"].slot_id for match in matches}
@@ -487,7 +568,22 @@ def draw_result(frame, gt_slots, pred_slots, matches, occupancy_predictions):
         color = (0, 180, 0) if pred_slot.slot_id in matched_pred_ids else (0, 220, 220)
         draw_polygon(output, pred_slot.points, color, f"P{pred_slot.slot_id}:{pred_status} {confidence:.2f}", y_offset=14)
 
+    for suppressed_idx, suppressed_slot in enumerate(suppressed_slots or [], start=1):
+        reason = str(suppressed_slot.get("reason", "suppressed"))
+        points = [(float(x), float(y)) for x, y in suppressed_slot.get("points", [])]
+        if len(points) == 4:
+            color = (0, 0, 255) if "transverse" in reason else (80, 80, 255)
+            draw_polygon(output, points, color, f"S{suppressed_label(reason, suppressed_idx)}", y_offset=28)
+
     return output
+
+
+def suppressed_label(reason: str, idx: int) -> str:
+    if "transverse" in reason:
+        return f"{idx}:cross"
+    if "duplicate" in reason:
+        return f"{idx}:dup"
+    return str(idx)
 
 
 def draw_polygon(image, points, color, label, y_offset: int = 0) -> None:

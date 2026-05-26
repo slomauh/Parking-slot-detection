@@ -5,7 +5,7 @@ video:
   json_path: "outputs/json/demo_result.json"
 
 runtime:
-  device: "cpu"
+  device: "cuda"
   detect_every_n_frames: 3
   parking_slot_every_n_frames: 5
   max_frames: null
@@ -14,7 +14,7 @@ vehicle_detector:
   backend: "yolo"  # mock | yolo
   enabled: true
   model_path: "models/vehicle/yolo11n.pt"
-  device: "cpu"
+  device: "cuda"
   classes:
     - car
     - truck
@@ -28,15 +28,19 @@ parking_slot_detector:
   backend: "crpsd"  # mock | crpsd
   model_path: "models/slot_detector/parkrecon3d_slot_detector_finetuned.pth"
   external_repo_path: "external/CRPS-D"
-  device: "cpu"
+  device: "cuda"
   depth_factor: 32
-  conf_threshold: 0.30
+  conf_threshold: 0.20
   imgsz: 512
   slot_pairing_strategy: "relaxed"  # crpsd | relaxed
+  slot_postprocess_mode: "row_consensus"  # standard | row_consensus
   pairing_distance_scale: 1.0
   max_point_degree: 2
   min_slot_score: 0.35
   slot_nms_iou: 0.0
+  slot_center_nms_distance: 28.0
+  slot_angle_nms_threshold: 20.0
+  slot_centerline_overlap_threshold: 0.0
   geometry_filter_enabled: false
   min_slot_area_ratio: 0.0
   max_slot_area_ratio: 1.0
@@ -46,6 +50,7 @@ parking_slot_detector:
   orientation_neighbor_radius: 130.0
   orientation_min_neighbors: 2
   orientation_angle_threshold: 60.0
+  orientation_score_margin: 1.05
 
 temporal_slot_smoothing:
   enabled: true
@@ -74,7 +79,7 @@ occupancy:
   free_confirm_frames: 10
   classifier:
     model_path: "models/occupancy/efficientnet_b0_crpsd.pt"
-    device: "cpu"
+    device: "cuda"
     crop_size: 224
     occupied_threshold: 0.50
     use_pretrained_backbone: false
