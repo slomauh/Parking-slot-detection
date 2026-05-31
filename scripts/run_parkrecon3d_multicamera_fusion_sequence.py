@@ -335,7 +335,7 @@ def main() -> None:
         "evidence_events_csv": str(output_dir / "camera_evidence_events.csv"),
         "evidence_events_jsonl": str(output_dir / "camera_evidence_events.jsonl"),
         "event_count": len(events),
-        "note": "Camera evidence only turns slots occupied; absence of camera evidence never means free.",
+        "note": "Camera vehicle detections are diagnostic evidence only in the default config; occupancy status is decided by EfficientNet.",
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (output_dir / "timeline.json").write_text(json.dumps({"frames": timeline}, indent=2), encoding="utf-8")

@@ -89,7 +89,7 @@ occupancy:
   slot_coverage_threshold: 0.20
   speed_threshold_px: 2.0
   camera_vehicle_fusion:
-    enabled: true
+    enabled: false
     vehicle_conf: 0.50
     vehicle_imgsz: 960
     match_distance_px: 75.0
@@ -118,11 +118,11 @@ occupancy:
     near_max_height_ratio: 0.85
     near_max_area_ratio: 0.45
     near_min_score: 0.70
-    note: "Camera evidence can mark occupied, but absence of camera evidence does not mark free."
+    note: "Camera vehicle detection is kept as diagnostic evidence only; occupancy status is decided by EfficientNet."
   occupied_confirm_frames: 5
   free_confirm_frames: 10
   classifier:
-    model_path: "models/occupancy/efficientnet_b0_crpsd.pt"
+    model_path: "models/occupancy/efficientnet_b0_parkrecon_manual.pt"
     device: "cuda"
     crop_size: 224
     occupied_threshold: 0.50

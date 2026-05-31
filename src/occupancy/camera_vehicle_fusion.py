@@ -128,11 +128,14 @@ def fuse_classifier_and_camera_vehicle(
     slots: list[ParkingSlot],
     classifier_predictions: dict[int, tuple[str, float]],
     slot_evidence: dict[int, dict[str, Any]],
+    camera_overrides_classifier: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fuse crop-classifier status with positive camera vehicle evidence.
+    """Attach camera vehicle evidence to crop-classifier occupancy decisions.
 
-    Camera evidence can mark a slot as occupied, but absence of camera evidence
-    never marks a slot as free because the perimeter cameras may not see it.
+    By default the EfficientNet crop classifier remains authoritative for
+    `fused_status`. Camera evidence is reported separately as a diagnostic
+    positive signal. The old behavior can still be enabled explicitly with
+    `camera_overrides_classifier=True`.
     """
 
     records = []
@@ -142,18 +145,14 @@ def fuse_classifier_and_camera_vehicle(
         camera_status = "occupied" if camera_evidence else "unknown"
         camera_confidence = float(camera_evidence["confidence"]) if camera_evidence else 0.0
 
-        if classifier_status == "occupied" and camera_status == "occupied":
-            fused_status = "occupied"
-            fused_confidence = max(float(classifier_confidence), camera_confidence)
-            source = "classifier+camera_vehicle"
-        elif camera_status == "occupied":
+        if classifier_status in {"occupied", "free"}:
+            fused_status = classifier_status
+            fused_confidence = float(classifier_confidence)
+            source = "classifier+camera_vehicle_evidence" if camera_evidence else "classifier"
+        elif camera_overrides_classifier and camera_status == "occupied":
             fused_status = "occupied"
             fused_confidence = camera_confidence
             source = "camera_vehicle"
-        elif classifier_status in {"occupied", "free"}:
-            fused_status = classifier_status
-            fused_confidence = float(classifier_confidence)
-            source = "classifier"
         else:
             fused_status = "unknown"
             fused_confidence = 0.0

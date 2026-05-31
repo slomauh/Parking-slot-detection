@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 
 from src.detection.schemas import ParkingSlot
-from src.occupancy.camera_vehicle_fusion import match_projected_vehicle_points_to_slots
+from src.occupancy.camera_vehicle_fusion import fuse_classifier_and_camera_vehicle, match_projected_vehicle_points_to_slots
+from src.occupancy.estimator import OccupancyEstimator
 
 
 def slot(slot_id: int, x1: float, y1: float, x2: float, y2: float) -> ParkingSlot:
@@ -91,6 +92,43 @@ class CameraVehicleFusionTest(unittest.TestCase):
 
         self.assertEqual(evidence[1]["bbox"], (0.0, 0.0, 10.0, 10.0))
         self.assertEqual(evidence[1]["bbox_features"]["area_ratio"], 0.02)
+
+    def test_camera_evidence_does_not_override_classifier_by_default(self) -> None:
+        slots = [slot(1, 0, 0, 10, 10)]
+        classifier_predictions = {1: ("free", 0.8)}
+        slot_evidence = {1: {"confidence": 0.9, "source": "camera_vehicle"}}
+
+        records = fuse_classifier_and_camera_vehicle(slots, classifier_predictions, slot_evidence)
+
+        self.assertEqual(records[0]["fused_status"], "free")
+        self.assertEqual(records[0]["source"], "classifier+camera_vehicle_evidence")
+        self.assertEqual(records[0]["vehicle_projected_status"], "occupied")
+
+    def test_camera_evidence_override_is_explicit(self) -> None:
+        slots = [slot(1, 0, 0, 10, 10)]
+        classifier_predictions = {1: ("unknown", 0.0)}
+        slot_evidence = {1: {"confidence": 0.9, "source": "camera_vehicle"}}
+
+        records = fuse_classifier_and_camera_vehicle(
+            slots,
+            classifier_predictions,
+            slot_evidence,
+            camera_overrides_classifier=True,
+        )
+
+        self.assertEqual(records[0]["fused_status"], "occupied")
+        self.assertEqual(records[0]["source"], "camera_vehicle")
+
+    def test_estimator_default_config_can_ignore_camera_evidence(self) -> None:
+        estimator = OccupancyEstimator({"backend": "geometry", "camera_vehicle_fusion": {"enabled": False}})
+        decisions = estimator.estimate(
+            [slot(1, 0, 0, 10, 10)],
+            [],
+            camera_vehicle_evidence={1: {"confidence": 0.9, "source": "camera_vehicle"}},
+        )
+
+        self.assertEqual(decisions[1].status, "free")
+        self.assertEqual(decisions[1].source, "geometry")
 
 
 if __name__ == "__main__":

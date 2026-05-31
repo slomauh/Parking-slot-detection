@@ -470,19 +470,88 @@ contact_sheet.jpg
 
 Так как occupancy GT в ParkRecon3D нет, это именно visual QA, а не честная accuracy.
 
-## Camera vehicle -> BEV occupancy fusion
+## Ручная разметка occupancy для ParkRecon3D
 
-Экспериментальная связка для определения занятости через машины с периферийных камер:
+Для улучшения классификатора занятости подготовлен сборщик crops под ручную разметку. Он использует текущий YOLO-OBB slot detector, режет слоты так же, как inference-классификатор, прогоняет EfficientNet и по умолчанию выбирает самые неуверенные crops:
+
+```bash
+python scripts/prepare_parkrecon3d_occupancy_review.py \
+  --config configs/default.yaml \
+  --dataset-root /home/slomauh/Documents/parkrecon3d_dataset/data3 \
+  --max-crops 1000 \
+  --sample-strategy uncertain \
+  --device cuda \
+  --output-dir outputs/parkrecon3d_occupancy_manual_review
+```
+
+Выход:
+
+```text
+unlabeled/              # crops для ручной разметки
+context/                # полный BEV кадр с выделенным слотом
+labeled/free/           # сюда переносить свободные места
+labeled/occupied/       # сюда переносить занятые места
+labeled/skip/           # спорные/нечитаемые случаи
+manifest.csv
+manifest.json
+summary.json
+sheets/review_contact_sheet.jpg
+```
+
+После разметки split нужно делать по `timestamp`, а не случайно по crop-файлам, чтобы соседние кадры одного видео не утекли из train в val/test.
+
+Когда часть crops размечена, собрать leakage-safe split:
+
+```bash
+python scripts/build_parkrecon3d_occupancy_split.py \
+  --review-dir outputs/parkrecon3d_occupancy_manual_review \
+  --output-dir outputs/parkrecon3d_occupancy_finetune_dataset \
+  --val-ratio 0.2 \
+  --gap-timestamps 5
+```
+
+Дообучить EfficientNet от текущего checkpoint:
+
+```bash
+python scripts/train_occupancy_efficientnet.py \
+  --data-dir outputs/parkrecon3d_occupancy_finetune_dataset/train \
+  --val-dir outputs/parkrecon3d_occupancy_finetune_dataset/val \
+  --init-checkpoint models/occupancy/efficientnet_b0_crpsd.pt \
+  --output-path models/occupancy/efficientnet_b0_parkrecon_manual.pt \
+  --epochs 12 \
+  --batch-size 32 \
+  --lr 1e-5 \
+  --weighted-loss \
+  --device cuda
+```
+
+Первый ручной набор `163 free / 289 occupied` дал split `347 train / 99 val` и checkpoint:
+
+```text
+models/occupancy/efficientnet_b0_parkrecon_manual.pt
+```
+
+QA-прогон нового checkpoint на 200 ParkRecon3D BEV кадрах:
+
+```text
+outputs/parkrecon3d_yolo_obb_occupancy_manual_ft_smoke200/
+```
+
+## Camera vehicle -> BEV diagnostic evidence
+
+Экспериментальная связка для детекции ближайших машин с периферийных камер:
 
 ```text
 Camera0/1/2 frame
   -> YOLO vehicle detector
   -> projection bbox bottom points to BEV
   -> match projected points to YOLO-OBB parking slot polygons
-  -> fuse with EfficientNet occupancy classifier
+  -> save camera_vehicle evidence for visual QA
 ```
 
-Важно: это уже может работать со слотами из нашего BEV detector, а не только с GT-разметкой. Для этого используется `--slot-source detector`.
+Важно: статус `free / occupied` в основном pipeline сейчас определяется EfficientNet-B0 crop-classifier. Camera vehicle evidence оставлен как диагностический сигнал: он показывает, что рядом со слотом с боковой камеры была найдена машина, но не переписывает решение классификатора в дефолтном конфиге.
+
+Скрипт может работать со слотами из нашего BEV detector, а не только с GT-разметкой. Для этого используется `--slot-source detector`.
 
 Smoke-команда:
 
@@ -502,13 +571,14 @@ python scripts/evaluate_parkrecon3d_camera_vehicle_fusion.py \
 
 Параметры YOLO-OBB, vehicle detector, projection и strict inside-match подтягиваются из `configs/default.yaml`. Через CLI их можно переопределить точечно.
 
-Текущий основной режим для camera evidence консервативный:
+Текущий режим для camera evidence консервативный:
 
 - берется не больше одной ближайшей-looking машины на камеру;
 - для camera fusion используется `vehicle_conf: 0.50`;
 - слишком большие bbox отсекаются через `near_max_height_ratio: 0.85` и `near_max_area_ratio: 0.45`;
 - классы: `car`, `truck`, `motorcycle`; `bus` отключен из-за ложных срабатываний на колоннах;
 - projected point должен попасть внутрь polygon парковочного места (`require_inside_slot_match: true`);
+- camera evidence не переводит слот в `occupied` в основном режиме;
 - отсутствие camera evidence никогда не переводит слот в `free`.
 
 Ранний random smoke без строгого inside-match:
@@ -552,6 +622,7 @@ contact_sheet.jpg
 
 - Это visual QA, потому что в ParkRecon3D нет GT занятости.
 - Отсутствие машины на Camera0/1/2 не означает `free`: камера может не видеть слот.
+- Наличие camera evidence сейчас не является финальным статусом занятости: финальный статус остается за EfficientNet.
 - `--max-vehicles-per-camera 1` и `near-vehicles-only` включены, чтобы не тащить дальние машины в BEV.
 - В `camera_evidence_events.csv` сохраняются bbox ratios и `bbox_near_score`, чтобы быстро искать ложные слишком большие или слишком дальние detections.
 - Nearby-match оставлен как эксперимент через `--no-require-inside-slot-match`, но по умолчанию выключен для меньшего числа ложных привязок.
@@ -635,7 +706,7 @@ python scripts/audit_camera_fusion_evidence.py \
   --output-path outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/evidence_audit.json
 ```
 
-В этом режиме camera evidence не проходит через low-confidence hold от crop-classifier: если машина с периферийной камеры сматчилась со слотом, этот слот получает `source: camera_vehicle` и положительный `occupied` evidence. Отсутствие camera evidence по-прежнему не означает `free`.
+В актуальном режиме camera evidence не проходит через low-confidence hold от crop-classifier и не меняет финальный `free / occupied`. Если машина с периферийной камеры сматчилась со слотом, это сохраняется как `camera_vehicle` evidence в JSON/CSV и preview, а `fused_status` остается решением EfficientNet.
 
 Команда для такого positive smoke:
 
@@ -704,16 +775,16 @@ docs/parkrecon3d_camera_projection.md
 12. Подготовлен YOLO-OBB датасет.
 13. Обучен YOLO-OBB checkpoint на 15 эпохах.
 14. YOLO-OBB проверен на полном ParkRecon3D test split и стал основным slot detector.
-15. Добавлен экспериментальный camera vehicle -> BEV occupancy fusion со слотами из YOLO-OBB detector.
+15. Добавлен экспериментальный camera vehicle -> BEV diagnostic evidence со слотами из YOLO-OBB detector.
 
 ## Что делать дальше
 
 Ближайшие шаги:
 
-1. Визуально проверить `bev_preview/` из camera vehicle fusion и оценить, насколько projected points реально попадают в машины/слоты.
+1. Визуально проверить `bev_preview/` из camera vehicle evidence и оценить, насколько projected points реально попадают в машины/слоты.
 2. Подобрать более разумный near-vehicle фильтр, который убирает дальние машины, но не обнуляет `slots_with_camera_evidence`.
-3. Прогнать camera fusion на полном test sequence и отдельно сохранить кадры с `source=camera_vehicle`.
-4. Собрать видео/sequence preview уже с `fused_status`.
+3. Использовать боковые камеры только как отдельный сигнал/диагностику, пока projection не станет достаточно стабильной.
+4. Собрать видео/sequence preview с финальным статусом от EfficientNet и отдельным overlay для camera evidence.
 5. Если occupancy classifier визуально ошибается на ParkRecon3D, собрать 300-1000 crops и вручную доразметить `free/occupied` для дообучения classifier под новый домен.
 
 ## Важные замечания

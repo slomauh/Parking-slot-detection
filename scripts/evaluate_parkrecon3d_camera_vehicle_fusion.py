@@ -472,7 +472,7 @@ def main() -> None:
         "camera_preview_dir": str(camera_preview_dir),
         "bev_preview_dir": str(bev_preview_dir),
         "contact_sheet": str(output_dir / "contact_sheet.jpg"),
-        "note": "No ParkRecon3D vehicle/occupancy GT is available here; this is visual QA and evidence fusion only.",
+        "note": "No ParkRecon3D vehicle/occupancy GT is available here; camera detections are visual QA evidence, while fused_status follows the EfficientNet classifier by default.",
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
