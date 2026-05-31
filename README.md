@@ -37,17 +37,21 @@ ParkRecon3D BEV
 
 ## Примеры
 
-### CRPS-D, полный пайплайн
+### ParkRecon3D, полный пайплайн
 
-![CRPS-D full pipeline](docs/assets/crpsd_full_pipeline_example.jpg)
+![ParkRecon3D full pipeline](docs/assets/parkrecon3d_full_pipeline_example.jpg)
 
-### CRPS-D, проверка occupancy classifier на GT-слотах
+### ParkRecon3D, crops занятости
 
-![CRPS-D occupancy](docs/assets/crpsd_occupancy_example.jpg)
+![ParkRecon3D occupancy crops](docs/assets/parkrecon3d_occupancy_crops_example.jpg)
 
-### ParkRecon3D BEV
+### ParkRecon3D, боковые камеры и детекция машин
 
-![ParkRecon3D BEV](docs/assets/parkrecon3d_bev_example.jpg)
+![ParkRecon3D side camera vehicle detection](docs/assets/parkrecon3d_side_camera_vehicle_detection.jpg)
+
+### ParkRecon3D, full test contact sheet
+
+![ParkRecon3D full test contact sheet](docs/assets/parkrecon3d_full_test_contact_sheet.jpg)
 
 ## Структура проекта
 
