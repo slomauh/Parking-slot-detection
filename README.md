@@ -14,7 +14,7 @@
 
 ## Текущее состояние
 
-Главный вывод после последних экспериментов: CRPS-D marking-point detector оказался ограничен pairing/postprocess логикой, а YOLO-OBB на ParkRecon3D BEV резко поднял качество. Поэтому основной кандидат на slot detector сейчас - YOLO-OBB, который сразу предсказывает повернутый четырехугольник парковочного места.
+Главный вывод после последних экспериментов: CRPS-D marking-point detector оказался ограничен pairing/postprocess логикой, а YOLO-OBB на ParkRecon3D BEV резко поднял качество. Поэтому основной slot detector сейчас - YOLO-OBB, который сразу предсказывает повернутый четырехугольник парковочного места. CRPS-D остается baseline/fallback для сравнения.
 
 В репозитории есть:
 
@@ -143,7 +143,7 @@ pip install ultralytics
 
 ## Конфиг
 
-`configs/default.yaml` пока хранит CRPS-D/postprocess настройки как совместимый baseline. Для YOLO-OBB нужно переключить блок `parking_slot_detector` так:
+`configs/default.yaml` по умолчанию использует YOLO-OBB:
 
 ```yaml
 parking_slot_detector:
@@ -154,7 +154,37 @@ parking_slot_detector:
   imgsz: 1024
 ```
 
+Temporal smoothing в дефолтном режиме выключен: он был экспериментом для CRPS-D, а YOLO-OBB уже дает стабильные слоты без восстановления marking-point пар.
+
 Если CUDA недоступна, использовать `device: "cpu"`.
+
+## Прогноз освобождения места
+
+В проект добавлен эвристический модуль `src/occupancy/release_predictor.py`. Он не заменяет классификацию `free / occupied`, а поверх занятого места считает вероятность, что место скоро освободится.
+
+Используемые признаки:
+
+- `slot_vehicle_overlap` - коэффициент пересечения автомобиля с парковочным местом. Числовой порог зафиксирован в конфиге как `slot_vehicle_overlap_threshold: 0.20`.
+- `motion_state` - анализ движения автомобиля по нескольким кадрам на основе истории центров track. Так система отличает стоящий автомобиль от машины, которая просто проезжает мимо.
+- `pedestrian_nearby` - наличие пешехода рядом с автомобилем как признак возможной подготовки к выезду.
+- `brake_lights_on` - эвристика стоп-сигналов: яркие красные области в нижней/задней части bbox автомобиля.
+- `release_probability` - единый score, объединяющий overlap, движение, пешехода и стоп-сигналы.
+
+Порог и веса настраиваются в `configs/default.yaml`:
+
+```yaml
+release_prediction:
+  enabled: true
+  slot_vehicle_overlap_threshold: 0.20
+  pedestrian_near_distance_px: 90.0
+  brake_light_red_ratio_threshold: 0.015
+  parked_speed_threshold_px: 2.0
+  moving_speed_threshold_px: 5.0
+  motion_window: 5
+  release_probability_threshold: 0.65
+```
+
+Если `release_probability` превышает порог и слот уже считается занятым, статус может перейти в `soon_free`. В JSON для каждого слота сохраняются `release_probability` и подробные `release_features`.
 
 ## Запуск demo pipeline
 
@@ -170,6 +200,14 @@ python src/main.py --config configs/default.yaml
 outputs/videos/demo_result.mp4
 outputs/json/demo_result.json
 ```
+
+Быстрая regression-проверка camera fusion:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Проверка покрывает near-filter vehicle detector, camera->slot matcher и temporal memory для camera evidence.
 
 ## Occupancy classifier
 
@@ -432,6 +470,188 @@ contact_sheet.jpg
 
 Так как occupancy GT в ParkRecon3D нет, это именно visual QA, а не честная accuracy.
 
+## Camera vehicle -> BEV occupancy fusion
+
+Экспериментальная связка для определения занятости через машины с периферийных камер:
+
+```text
+Camera0/1/2 frame
+  -> YOLO vehicle detector
+  -> projection bbox bottom points to BEV
+  -> match projected points to YOLO-OBB parking slot polygons
+  -> fuse with EfficientNet occupancy classifier
+```
+
+Важно: это уже может работать со слотами из нашего BEV detector, а не только с GT-разметкой. Для этого используется `--slot-source detector`.
+
+Smoke-команда:
+
+```bash
+python scripts/evaluate_parkrecon3d_camera_vehicle_fusion.py \
+  --dataset-root /home/slomauh/Documents/parkrecon3d_dataset/data3 \
+  --timestamps-from-label-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/slot_label \
+  --slot-source detector \
+  --device cuda \
+  --sample-strategy random \
+  --seed 7 \
+  --limit 30 \
+  --min-camera-detections 1 \
+  --max-candidates 300 \
+  --output-dir outputs/parkrecon3d_camera_vehicle_fusion_detector_smoke30
+```
+
+Параметры YOLO-OBB, vehicle detector, projection и strict inside-match подтягиваются из `configs/default.yaml`. Через CLI их можно переопределить точечно.
+
+Текущий основной режим для camera evidence консервативный:
+
+- берется не больше одной ближайшей-looking машины на камеру;
+- для camera fusion используется `vehicle_conf: 0.50`;
+- слишком большие bbox отсекаются через `near_max_height_ratio: 0.85` и `near_max_area_ratio: 0.45`;
+- классы: `car`, `truck`, `motorcycle`; `bus` отключен из-за ложных срабатываний на колоннах;
+- projected point должен попасть внутрь polygon парковочного места (`require_inside_slot_match: true`);
+- отсутствие camera evidence никогда не переводит слот в `free`.
+
+Ранний random smoke без строгого inside-match:
+
+```text
+processed frames: 30
+detected BEV slots: 140
+camera vehicle detections: 69
+projected points: 226
+slots_with_camera_evidence: 14
+```
+
+С ограничением на ближайшие detections:
+
+```bash
+  --max-vehicles-per-camera 1
+```
+
+получился более чистый smoke:
+
+```text
+processed frames: 30
+detected BEV slots: 140
+camera vehicle detections: 48
+projected points: 160
+slots_with_camera_evidence: 12
+```
+
+Выход:
+
+```text
+summary.json
+records.json
+preview/
+camera_preview/
+bev_preview/
+contact_sheet.jpg
+```
+
+Ограничения:
+
+- Это visual QA, потому что в ParkRecon3D нет GT занятости.
+- Отсутствие машины на Camera0/1/2 не означает `free`: камера может не видеть слот.
+- `--max-vehicles-per-camera 1` и `near-vehicles-only` включены, чтобы не тащить дальние машины в BEV.
+- В `camera_evidence_events.csv` сохраняются bbox ratios и `bbox_near_score`, чтобы быстро искать ложные слишком большие или слишком дальние detections.
+- Nearby-match оставлен как эксперимент через `--no-require-inside-slot-match`, но по умолчанию выключен для меньшего числа ложных привязок.
+
+Для видео-подобной проверки всей связки есть sequence-runner:
+
+```bash
+python scripts/run_parkrecon3d_multicamera_fusion_sequence.py \
+  --config configs/default.yaml \
+  --dataset-root /home/slomauh/Documents/parkrecon3d_dataset/data3 \
+  --timestamps-from-label-dir outputs/parkrecon3d_bev_crpsd_format/raw/test/slot_label \
+  --limit 120 \
+  --slot-every-n 3 \
+  --vehicle-every-n 3 \
+  --max-vehicles-per-camera 1 \
+  --require-inside-slot-match \
+  --preview-every-n 20 \
+  --output-dir outputs/parkrecon3d_multicamera_fusion_sequence \
+  --device cuda
+```
+
+Выход:
+
+```text
+video.mp4
+summary.json
+timeline.json
+events.json
+preview_frames/
+camera_preview/
+```
+
+Smoke на 5 кадрах, где точно есть camera evidence:
+
+```text
+frames: 5
+detected BEV slots: 38
+camera detections: 9
+projected points: 36
+slots_with_camera_evidence: 7
+```
+
+Проверенный full test прогон с текущими calibrated defaults и strict inside-match:
+
+```text
+output: outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/
+frames: 1001
+slot_detection_runs: 334
+vehicle_detection_runs: 334
+camera detections: 183
+projected points: 732
+slots_with_camera_evidence: 136
+direct_camera_evidence: 30
+held_camera_evidence: 106
+vehicle_conf: 0.50
+match_type: inside only
+classes in evidence: car only
+multi-evidence frames: 0
+```
+
+Проверенный выход:
+
+```text
+outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/
+  video.mp4
+  summary.json
+  timeline.json
+  events.json
+  camera_evidence_events.csv
+  camera_evidence_events.jsonl
+  evidence_audit.json
+  evidence_frames/
+```
+
+Аудит full-run evidence:
+
+```bash
+python scripts/audit_camera_fusion_evidence.py \
+  --csv-path outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/camera_evidence_events.csv \
+  --summary-path outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/summary.json \
+  --output-path outputs/parkrecon3d_multicamera_fusion_sequence_conf050_bbox_filter_full/evidence_audit.json
+```
+
+В этом режиме camera evidence не проходит через low-confidence hold от crop-classifier: если машина с периферийной камеры сматчилась со слотом, этот слот получает `source: camera_vehicle` и положительный `occupied` evidence. Отсутствие camera evidence по-прежнему не означает `free`.
+
+Команда для такого positive smoke:
+
+```bash
+python scripts/run_parkrecon3d_multicamera_fusion_sequence.py \
+  --config configs/default.yaml \
+  --dataset-root /home/slomauh/Documents/parkrecon3d_dataset/data3 \
+  --timestamps 2033454050417 2033655085410 2099758105863 2099159067910 2035154079978 \
+  --slot-every-n 1 \
+  --vehicle-every-n 1 \
+  --max-vehicles-per-camera 1 \
+  --preview-every-n 1 \
+  --output-dir outputs/parkrecon3d_multicamera_fusion_sequence_evidence5 \
+  --device cuda
+```
+
 ## ParkRecon3D Camera0/Camera1/Camera2
 
 В ParkRecon3D есть обычные камеры:
@@ -483,19 +703,18 @@ docs/parkrecon3d_camera_projection.md
 11. Сделан вывод, что CRPS-D pairing близок к потолку для ParkRecon3D.
 12. Подготовлен YOLO-OBB датасет.
 13. Обучен YOLO-OBB checkpoint на 15 эпохах.
-14. YOLO-OBB проверен на полном ParkRecon3D test split и стал основным кандидатом.
+14. YOLO-OBB проверен на полном ParkRecon3D test split и стал основным slot detector.
+15. Добавлен экспериментальный camera vehicle -> BEV occupancy fusion со слотами из YOLO-OBB detector.
 
 ## Что делать дальше
 
 Ближайшие шаги:
 
-1. Дождаться полного YOLO-OBB обучения на 80 эпохах.
-2. Положить новый `best.pt` в `models/slot_detector/`.
-3. Повторить `slot_conf` sweep, потому что оптимальный порог может сместиться.
-4. Переключить `configs/default.yaml` на YOLO-OBB как основной backend, если новый checkpoint подтверждает качество.
-5. Прогнать full pipeline `YOLO-OBB -> occupancy classifier` на полном ParkRecon3D test sequence.
-6. Собрать видео/sequence preview.
-7. Если occupancy визуально ошибается на ParkRecon3D, собрать 300-1000 crops и вручную доразметить `free/occupied` для дообучения classifier под новый домен.
+1. Визуально проверить `bev_preview/` из camera vehicle fusion и оценить, насколько projected points реально попадают в машины/слоты.
+2. Подобрать более разумный near-vehicle фильтр, который убирает дальние машины, но не обнуляет `slots_with_camera_evidence`.
+3. Прогнать camera fusion на полном test sequence и отдельно сохранить кадры с `source=camera_vehicle`.
+4. Собрать видео/sequence preview уже с `fused_status`.
+5. Если occupancy classifier визуально ошибается на ParkRecon3D, собрать 300-1000 crops и вручную доразметить `free/occupied` для дообучения classifier под новый домен.
 
 ## Важные замечания
 

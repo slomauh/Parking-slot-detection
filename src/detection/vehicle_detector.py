@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import torch
 
 from src.detection.schemas import Detection
 
@@ -26,6 +27,14 @@ class VehicleDetector:
         self.conf_threshold = float(config.get("conf_threshold", 0.35))
         self.imgsz = int(config.get("imgsz", 640))
         self.allowed_classes = set(config.get("classes", []))
+        self.min_bottom_y_ratio = float(config.get("min_bottom_y_ratio", 0.0))
+        self.min_bbox_height_ratio = float(config.get("min_bbox_height_ratio", 0.0))
+        self.min_bbox_area_ratio = float(config.get("min_bbox_area_ratio", 0.0))
+        self.max_bbox_height_ratio = float(config.get("max_bbox_height_ratio", 1.0))
+        self.max_bbox_area_ratio = float(config.get("max_bbox_area_ratio", 1.0))
+        self.min_near_score = float(config.get("min_near_score", 0.0))
+        self.max_detections = int(config.get("max_detections", 0))
+        self.near_filter_classes = set(config.get("near_filter_classes", []))
         self.model = None
 
         if self.backend not in {"mock", "yolo"}:
@@ -52,11 +61,15 @@ class VehicleDetector:
         if self.model is None:
             self.model = self._load_yolo_model()
 
+        device_name = self.device
+        if device_name != "cpu" and not torch.cuda.is_available():
+            device_name = "cpu"
+
         results = self.model.predict(
             source=frame,
             conf=self.conf_threshold,
             imgsz=self.imgsz,
-            device=self.device,
+            device=device_name,
             verbose=False,
         )
         if not results:
@@ -81,7 +94,63 @@ class VehicleDetector:
                 )
             )
 
-        return detections
+        return self._filter_and_rank_detections(detections, frame.shape[1], frame.shape[0])
+
+    def _filter_and_rank_detections(
+        self,
+        detections: list[Detection],
+        width: int,
+        height: int,
+    ) -> list[Detection]:
+        if not detections:
+            return []
+
+        filtered = []
+        passthrough = []
+        for detection in detections:
+            should_apply_near_filter = not self.near_filter_classes or detection.class_name in self.near_filter_classes
+            if not should_apply_near_filter:
+                passthrough.append(detection)
+                continue
+
+            features = self._bbox_near_features(detection, width, height)
+            if features["bottom_y_ratio"] < self.min_bottom_y_ratio:
+                continue
+            if features["height_ratio"] < self.min_bbox_height_ratio:
+                continue
+            if features["area_ratio"] < self.min_bbox_area_ratio:
+                continue
+            if features["height_ratio"] > self.max_bbox_height_ratio:
+                continue
+            if features["area_ratio"] > self.max_bbox_area_ratio:
+                continue
+            if features["near_score"] < self.min_near_score:
+                continue
+            filtered.append((detection, features["near_score"]))
+
+        filtered.sort(key=lambda item: item[1], reverse=True)
+        ranked = [detection for detection, _ in filtered]
+        if self.max_detections > 0:
+            ranked = ranked[: self.max_detections]
+        return ranked + passthrough
+
+    @staticmethod
+    def _bbox_near_features(detection: Detection, width: int, height: int) -> dict[str, float]:
+        x1, y1, x2, y2 = detection.bbox
+        bbox_width = max(0.0, x2 - x1)
+        bbox_height = max(0.0, y2 - y1)
+        width_ratio = bbox_width / max(1, width)
+        bottom_y_ratio = y2 / max(1, height)
+        height_ratio = bbox_height / max(1, height)
+        area_ratio = (bbox_width * bbox_height) / max(1, width * height)
+        near_score = bottom_y_ratio + 2.0 * height_ratio + 8.0 * area_ratio
+        return {
+            "width_ratio": float(width_ratio),
+            "bottom_y_ratio": float(bottom_y_ratio),
+            "height_ratio": float(height_ratio),
+            "area_ratio": float(area_ratio),
+            "near_score": float(near_score),
+        }
 
     def _load_yolo_model(self):
         try:

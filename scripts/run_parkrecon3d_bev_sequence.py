@@ -262,7 +262,12 @@ def hold_low_confidence_decisions(
     stabilized = {}
     for slot_id, decision in decisions.items():
         previous_status = previous_states.get(slot_id).status if slot_id in previous_states else "unknown"
-        if decision.confidence < low_confidence_threshold and previous_status in {"free", "occupied"}:
+        is_camera_vehicle_evidence = "camera_vehicle" in decision.source
+        if (
+            not is_camera_vehicle_evidence
+            and decision.confidence < low_confidence_threshold
+            and previous_status in {"free", "occupied"}
+        ):
             stabilized[slot_id] = OccupancyDecision(
                 slot_id=decision.slot_id,
                 status=previous_status,

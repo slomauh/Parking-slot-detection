@@ -13,6 +13,9 @@ class OccupancyEstimator:
         self.backend = str(config.get("backend", "geometry")).lower()
         self.coverage_threshold = float(config.get("slot_coverage_threshold", 0.20))
         self.speed_threshold_px = float(config.get("speed_threshold_px", 2.0))
+        self.vehicle_classes = set(config.get("vehicle_classes", ["car", "truck", "bus", "motorcycle"]))
+        camera_fusion_config = config.get("camera_vehicle_fusion", {})
+        self.camera_vehicle_fusion_enabled = bool(camera_fusion_config.get("enabled", False))
         self.classifier = None
         if self.backend == "classifier":
             self.classifier = EfficientNetOccupancyClassifier(config.get("classifier", {}))
@@ -24,13 +27,14 @@ class OccupancyEstimator:
         slots: list[ParkingSlot],
         tracks: list[Track],
         frame: np.ndarray | None = None,
+        camera_vehicle_evidence: dict[int, dict] | None = None,
     ) -> dict[int, OccupancyDecision]:
         if self.backend == "classifier":
             if frame is None:
                 raise ValueError("Occupancy classifier backend requires current frame")
             assert self.classifier is not None
             predictions = self.classifier.predict(frame, slots)
-            return {
+            decisions = {
                 slot.slot_id: OccupancyDecision(
                     slot_id=slot.slot_id,
                     status=predictions.get(slot.slot_id, ("unknown", 0.0))[0],
@@ -40,8 +44,10 @@ class OccupancyEstimator:
                 )
                 for slot in slots
             }
+            return self._apply_camera_vehicle_evidence(decisions, camera_vehicle_evidence)
 
-        return self._estimate_geometry(slots, tracks)
+        decisions = self._estimate_geometry(slots, tracks)
+        return self._apply_camera_vehicle_evidence(decisions, camera_vehicle_evidence)
 
     def _estimate_geometry(self, slots: list[ParkingSlot], tracks: list[Track]) -> dict[int, OccupancyDecision]:
         decisions: dict[int, OccupancyDecision] = {}
@@ -49,6 +55,8 @@ class OccupancyEstimator:
             assigned_track_id = None
             best_score = 0.0
             for track in tracks:
+                if track.class_name not in self.vehicle_classes:
+                    continue
                 coverage = slot_bbox_coverage(slot.points, track.bbox)
                 bottom_center = ((track.bbox[0] + track.bbox[2]) / 2.0, track.bbox[3])
                 is_in_slot = point_in_polygon(bottom_center, slot.points)
@@ -64,4 +72,35 @@ class OccupancyEstimator:
                 source="geometry",
                 assigned_track_id=assigned_track_id,
             )
+        return decisions
+
+    def _apply_camera_vehicle_evidence(
+        self,
+        decisions: dict[int, OccupancyDecision],
+        camera_vehicle_evidence: dict[int, dict] | None,
+    ) -> dict[int, OccupancyDecision]:
+        if not self.camera_vehicle_fusion_enabled or not camera_vehicle_evidence:
+            return decisions
+
+        for slot_id, evidence in camera_vehicle_evidence.items():
+            existing = decisions.get(slot_id)
+            camera_confidence = float(evidence.get("confidence", 0.0))
+            if existing is None:
+                decisions[slot_id] = OccupancyDecision(
+                    slot_id=slot_id,
+                    status="occupied",
+                    confidence=camera_confidence,
+                    source="camera_vehicle",
+                    assigned_track_id=None,
+                )
+                continue
+
+            if existing.status == "occupied":
+                existing.confidence = max(float(existing.confidence), camera_confidence)
+                existing.source = f"{existing.source}+camera_vehicle"
+            else:
+                existing.status = "occupied"
+                existing.confidence = camera_confidence
+                existing.source = "camera_vehicle"
+                existing.assigned_track_id = None
         return decisions

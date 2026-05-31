@@ -13,6 +13,7 @@ from tqdm import tqdm
 from src.detection.parking_slot_detector import ParkingSlotDetector
 from src.detection.vehicle_detector import VehicleDetector
 from src.occupancy.estimator import OccupancyEstimator
+from src.occupancy.release_predictor import ReleasePredictor
 from src.occupancy.state_manager import TemporalStateManager
 from src.tracking.tracker import Tracker
 from src.utils.config import load_config
@@ -53,6 +54,7 @@ def main() -> None:
     slot_detector = ParkingSlotDetector(config.get("parking_slot_detector", {}))
     tracker = Tracker(config.get("tracker", {}))
     occupancy_estimator = OccupancyEstimator(config.get("occupancy", {}))
+    release_predictor = ReleasePredictor(config.get("release_prediction", {}))
     state_manager = TemporalStateManager(config.get("occupancy", {}))
     visualizer = Visualizer(config.get("visualization", {}))
 
@@ -77,6 +79,8 @@ def main() -> None:
             tracks = tracker.update(last_detections)
             decisions = occupancy_estimator.estimate(last_slots, tracks, frame)
             states = state_manager.update(frame_idx, last_slots, decisions)
+            release_predictions = release_predictor.update(frame_idx, frame, last_slots, tracks)
+            apply_release_predictions(states, release_predictions, release_predictor.release_probability_threshold)
 
             rendered = visualizer.draw(frame, last_detections, tracks, states)
             writer.write(rendered)
@@ -91,6 +95,8 @@ def main() -> None:
                             "assigned_track_id": state.assigned_track_id,
                             "confidence": state.confidence,
                             "source": state.source,
+                            "release_probability": state.release_probability,
+                            "release_features": state.release_features,
                             "occupied_counter": state.occupied_counter,
                             "free_counter": state.free_counter,
                             "points": state.slot.points if state.slot else None,
@@ -123,6 +129,25 @@ def main() -> None:
         LOGGER.info("Saved JSON output to %s", json_path)
 
     LOGGER.info("Pipeline finished. Processed %d frames.", len(json_frames))
+
+
+def apply_release_predictions(states, release_predictions, threshold: float) -> None:
+    for state in states:
+        prediction = release_predictions.get(state.slot_id)
+        if prediction is None:
+            state.release_probability = None
+            state.release_features = None
+            continue
+
+        state.release_probability = prediction.release_probability
+        state.release_features = prediction.features
+        if (
+            prediction.release_probability >= threshold
+            and prediction.is_vehicle_occupying
+            and state.status in {"occupied", "potentially_occupied"}
+        ):
+            state.status = "soon_free"
+            state.source = f"{state.source}+release_prediction"
 
 
 def create_demo_video(path: str, frame_size: tuple[int, int] = (960, 540), frames: int = 60) -> None:

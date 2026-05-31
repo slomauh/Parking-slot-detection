@@ -47,6 +47,8 @@ class SlotState:
     assigned_track_id: int | None = None
     confidence: float | None = None
     source: str = "unknown"
+    release_probability: float | None = None
+    release_features: dict | None = None
     slot: ParkingSlot | None = field(default=None, repr=False)
 
 

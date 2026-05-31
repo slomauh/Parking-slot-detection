@@ -18,20 +18,29 @@ vehicle_detector:
   classes:
     - car
     - truck
-    - bus
     - motorcycle
     - person
   conf_threshold: 0.35
   imgsz: 640
+  near_filter_classes:
+    - car
+    - truck
+    - bus
+    - motorcycle
+  min_bottom_y_ratio: 0.35
+  min_bbox_height_ratio: 0.08
+  min_bbox_area_ratio: 0.010
+  min_near_score: 0.70
+  max_detections: 1
 
 parking_slot_detector:
-  backend: "crpsd"  # mock | crpsd
-  model_path: "models/slot_detector/parkrecon3d_slot_detector_finetuned.pth"
+  backend: "yolo_obb"  # mock | crpsd | yolo_obb
+  model_path: "models/slot_detector/best_yolo_parkrecon.pt"
   external_repo_path: "external/CRPS-D"
   device: "cuda"
   depth_factor: 32
-  conf_threshold: 0.20
-  imgsz: 512
+  conf_threshold: 0.55
+  imgsz: 1024
   slot_pairing_strategy: "relaxed"  # crpsd | relaxed
   slot_postprocess_mode: "row_consensus"  # standard | row_consensus
   pairing_distance_scale: 1.0
@@ -53,7 +62,7 @@ parking_slot_detector:
   orientation_score_margin: 1.05
 
 temporal_slot_smoothing:
-  enabled: true
+  enabled: false
   mode: "quality_fill_gap"
   window: 5
   min_hits: 2
@@ -73,8 +82,43 @@ tracker:
 
 occupancy:
   backend: "classifier"  # geometry | classifier
+  vehicle_classes:
+    - car
+    - truck
+    - motorcycle
   slot_coverage_threshold: 0.20
   speed_threshold_px: 2.0
+  camera_vehicle_fusion:
+    enabled: true
+    vehicle_conf: 0.50
+    vehicle_imgsz: 960
+    match_distance_px: 75.0
+    max_projected_distance_m: 5.0
+    min_projected_points_per_evidence: 1
+    min_camera_evidence_score: 0.05
+    min_camera_distance_quality: 0.30
+    require_inside_slot_match: true
+    camera_evidence_hold_frames: 6
+    camera_evidence_decay: 0.85
+    min_held_camera_evidence_score: 0.03
+    max_vehicles_per_camera: 1
+    rotation_mode: "rt"
+    camera_origin_sign: "negative_t"
+    bev_cx: 586.5
+    bev_cy: 725.5
+    bev_meter_per_pixel: 0.0085
+    swap_xy: true
+    flip_x: false
+    flip_y: true
+    near_vehicles_only: true
+    near_filter_mode: "all"
+    near_min_bottom_y_ratio: 0.35
+    near_min_height_ratio: 0.08
+    near_min_area_ratio: 0.010
+    near_max_height_ratio: 0.85
+    near_max_area_ratio: 0.45
+    near_min_score: 0.70
+    note: "Camera evidence can mark occupied, but absence of camera evidence does not mark free."
   occupied_confirm_frames: 5
   free_confirm_frames: 10
   classifier:
@@ -83,6 +127,28 @@ occupancy:
     crop_size: 224
     occupied_threshold: 0.50
     use_pretrained_backbone: false
+
+release_prediction:
+  enabled: true
+  vehicle_classes:
+    - car
+    - truck
+    - bus
+    - motorcycle
+  pedestrian_classes:
+    - person
+  slot_vehicle_overlap_threshold: 0.20
+  pedestrian_near_distance_px: 90.0
+  brake_light_red_ratio_threshold: 0.015
+  parked_speed_threshold_px: 2.0
+  moving_speed_threshold_px: 5.0
+  motion_window: 5
+  release_probability_threshold: 0.65
+  base_score: 0.05
+  overlap_weight: 0.10
+  pedestrian_weight: 0.30
+  brake_light_weight: 0.35
+  motion_weight: 0.20
 
 visualization:
   draw_slots: true
